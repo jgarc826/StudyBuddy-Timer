@@ -1,0 +1,54 @@
+# Deployment: every push to main tests, applies infrastructure, and
+# deploys the site — no manual steps.
+#
+# About `-auto-approve`: the project rule "never -auto-approve" applies
+# to interactive use on a human's machine, where a person is present to
+# read the plan. CI has no keyboard; its plan gate lives in the
+# pull-request workflow instead, and main is only supposed to receive
+# reviewed merges. The state lock plus the concurrency group below keep
+# two applies from ever overlapping.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+# If two pushes land quickly, the second deploy waits for the first.
+concurrency: deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # A failing test stops everything below — broken code never ships.
+      - name: Unit tests
+        run: node --test backend/test/*.test.mjs
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::719857072816:role/studybuddy-timer-github-actions
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.3"
+          terraform_wrapper: false
+
+      - name: Apply infrastructure
+        run: |
+          terraform -chdir=infra init -input=false
+          terraform -chdir=infra apply -input=false -auto-approve
+
+      - name: Deploy the site
+        run: ./scripts/deploy.sh

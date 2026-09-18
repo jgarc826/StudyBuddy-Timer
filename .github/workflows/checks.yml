@@ -1,0 +1,59 @@
+# Pull-request checks: prove the change is sound BEFORE it can merge.
+# Nothing here changes AWS — the only terraform command is `plan`,
+# which computes and prints what WOULD change.
+
+name: checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read # may read the repo...
+  id-token: write # ...and may request an OIDC token to assume the AWS role
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # matches the Lambda runtime
+
+      - name: Unit tests
+        run: node --test backend/test/*.test.mjs
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trades the workflow's OIDC token for temporary AWS credentials.
+      # No secrets are stored in GitHub — see infra/ci.tf for the trust.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::719857072816:role/studybuddy-timer-github-actions
+          aws-region: us-east-1
+
+      # terraform_wrapper must stay off: it wraps output in extra text,
+      # which breaks scripts that read `terraform output -raw`.
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.3"
+          terraform_wrapper: false
+
+      - name: Formatting
+        run: terraform fmt -check -recursive
+
+      - name: Init (connects to the S3 state backend)
+        run: terraform init -input=false
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan (read-only preview of infrastructure changes)
+        run: terraform plan -input=false -no-color
