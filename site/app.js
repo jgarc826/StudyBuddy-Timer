@@ -207,6 +207,7 @@ async function recordSession(session) {
 async function refreshStats() {
   const sessions = await StudyStorage.loadSessions();
   renderTotal(sessions);
+  renderGrid(sessions);
 }
 
 function renderTotal(sessions) {
@@ -222,6 +223,75 @@ function renderTotal(sessions) {
     `${hours} hours studied · ${n} session${n === 1 ? '' : 's'}`;
 }
 
+/*
+  The contribution grid: one square per day, last 26 weeks, GitHub-style.
+  The layout trick lives in style.css — the container has 7 fixed rows and
+  grid-auto-flow: column, so appending squares in date order fills a week
+  top-to-bottom then moves one column right. All this code has to do is
+  append one <div> per day, starting on a Sunday.
+*/
+
+// A new Date shifted by n days. JS normalizes overflow ("Sept 40th" becomes
+// Oct 10) the same way mktime() normalizes a struct tm.
+function addDays(date, n) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + n);
+}
+
+// Bucket a day's minutes into a shade 0-4 (hour steps).
+function levelForMinutes(minutes) {
+  if (minutes === 0) return 0;
+  if (minutes < 60) return 1;
+  if (minutes < 120) return 2;
+  if (minutes < 180) return 3;
+  return 4;
+}
+
+function renderGrid(sessions) {
+  // Sum minutes per local day. Map is JS's hash map (std::unordered_map);
+  // `?? 0` means "and if there's no entry yet, start from 0".
+  const minutesByDate = new Map();
+  for (const s of sessions) {
+    minutesByDate.set(s.localDate, (minutesByDate.get(s.localDate) ?? 0) + s.minutes);
+  }
+
+  const today = new Date();
+  // Back to the Sunday of the current week (getDay(): Sun=0..Sat=6), then
+  // 25 more weeks -> 26 columns, current partial week included.
+  const gridStart = addDays(today, -(today.getDay() + 25 * 7));
+
+  // Build every square off-page in a DocumentFragment, attach once — one
+  // relayout instead of ~180.
+  const cells = document.createDocumentFragment();
+  for (let day = gridStart; day <= today; day = addDays(day, 1)) {
+    const minutes = minutesByDate.get(toLocalDateString(day)) ?? 0;
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+    // dataset.level = "2" becomes the attribute data-level="2" -> colored by CSS.
+    cell.dataset.level = String(levelForMinutes(minutes));
+    // `title` is the browser's built-in hover tooltip.
+    const pretty = day.toLocaleDateString(undefined,
+      { month: 'short', day: 'numeric', year: 'numeric' });
+    cell.title = minutes > 0 ? `${pretty} — ${minutes} min studied`
+                             : `${pretty} — no study`;
+    cells.appendChild(cell);
+  }
+  els.grid.replaceChildren(cells);
+
+  // Month labels: one slot per week column; text only where a month begins.
+  const labels = document.createDocumentFragment();
+  let lastMonth = -1;
+  for (let week = 0; week < 26; week++) {
+    const weekStart = addDays(gridStart, week * 7);
+    const slot = document.createElement('div');
+    if (weekStart.getMonth() !== lastMonth) {
+      slot.textContent = weekStart.toLocaleDateString(undefined, { month: 'short' });
+      lastMonth = weekStart.getMonth();
+    }
+    labels.appendChild(slot);
+  }
+  els.gridMonths.replaceChildren(labels);
+}
+
 /* ===== 6. Rendering ==================================================== */
 
 // Grab every element once, by id — a handle to the live page element, much
@@ -235,6 +305,8 @@ const els = {
   resetBtn: document.getElementById('reset-btn'),
   testBadge: document.getElementById('test-badge'),
   totalLine: document.getElementById('total-line'),
+  grid: document.getElementById('grid'),
+  gridMonths: document.getElementById('grid-months'),
 };
 
 // 3,000,000 ms at 60,000 ms/minute -> "50:00". In fast mode one nominal

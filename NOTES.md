@@ -157,3 +157,37 @@ API will accept — the shape is already frozen):
   storage.js and worth being able to explain in an interview.
 - **`Array.prototype.reduce` / `some`** — `std::accumulate` and
   `std::any_of` for JS arrays.
+
+### Step 4: the contribution grid
+
+**What was created:** the GitHub-style grid — one square per day for the
+last 26 weeks, darker green for more minutes, a native tooltip with the
+date and minutes on hover, month labels, and a Less→More legend.
+
+**How the layout works (the part worth understanding):** there is no
+positioning math in JavaScript. The container is a CSS grid with **7 fixed
+rows** and `grid-auto-flow: column`: children fill a column top-to-bottom
+(Sun→Sat), then start the next column (the next week). So the JS just
+appends one `<div>` per day in date order — it only has to make sure the
+very first square is a Sunday. Weeks-as-columns falls out of CSS.
+
+**How a square gets its color:** JS sets `cell.dataset.level = "3"`, which
+becomes the HTML attribute `data-level="3"`, and style.css maps each level
+to a green via attribute selectors (`.cell[data-level="3"] { ... }`).
+Levels are hour-buckets: 0 none, 1 under an hour, 2/3 one/two hours,
+4 three or more.
+
+**Terms that appear in this step:**
+
+- **`Map`** — JS's hash map (`std::unordered_map`). Used to sum minutes
+  per `localDate`.
+- **`??`** (nullish coalescing) — "if the left side is null/undefined, use
+  the right side": `map.get(key) ?? 0` reads "or start from zero".
+- **`DocumentFragment`** — an off-page container: build all ~180 squares in
+  it, attach once. One relayout instead of one per square. (Same instinct
+  as building a string in a buffer before printing.)
+- **`toLocaleDateString`** — formats a date in the user's locale; used for
+  tooltips ("Apr 1, 2026") and month labels.
+- **Date overflow normalization** — `new Date(2026, 8, 40)` quietly becomes
+  Oct 10, like `mktime` normalizing a `struct tm`; `addDays` relies on it,
+  which also makes the day-walk immune to daylight-saving-time hiccups.

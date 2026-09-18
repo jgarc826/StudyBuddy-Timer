@@ -40,6 +40,22 @@
     <section class="card history-card" aria-label="Study history">
       <h2>Your history</h2>
       <p id="total-line" class="total-line">No sessions yet.</p>
+
+      <!-- GitHub-style contribution grid: one square per day, filled in by
+           JavaScript. The scroller lets it scroll sideways on small screens. -->
+      <div class="grid-scroller">
+        <div id="grid-months" class="grid-months" aria-hidden="true"></div>
+        <div id="grid" class="grid" aria-label="Daily study minutes, last 26 weeks"></div>
+      </div>
+      <div class="legend" aria-hidden="true">
+        <span>Less</span>
+        <div class="cell" data-level="0"></div>
+        <div class="cell" data-level="1"></div>
+        <div class="cell" data-level="2"></div>
+        <div class="cell" data-level="3"></div>
+        <div class="cell" data-level="4"></div>
+        <span>More</span>
+      </div>
     </section>
   </main>
 
