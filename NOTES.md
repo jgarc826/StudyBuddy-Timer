@@ -635,3 +635,151 @@ apply+deploy on main (authenticated with an OIDC role, no stored keys);
 a CloudWatch alarm emails on Lambda errors, plus a small dashboard; and
 the README with architecture diagram, costs, limits, and the honest
 section on how AI tools were used and verified.
+
+## Stage 4 — automation and operations
+
+### Step 1: Terraform state in S3, with locking
+
+The state file is Terraform's memory; until now it lived only on this
+laptop, so CI could never apply anything. Now it lives in a dedicated S3
+bucket with **versioning** (every previous state kept — the undo button)
+and **lockfile locking** (`use_lockfile = true`, native in Terraform
+1.10+): an apply drops a lock object into the bucket, and a second apply
+anywhere in the world waits instead of corrupting shared state.
+
+The bucket comes from a deliberately **separate bootstrap configuration**
+(`infra/bootstrap/`, applied once, its own tiny state kept local): if the
+main config owned its own state bucket, `terraform destroy` would delete
+the memory of the destroy it was performing. Also unlike the site bucket
+there is *no* `force_destroy` here — this bucket is supposed to resist
+deletion. One quirk to remember: backend blocks are read before variables
+exist, so the bucket name in `backend.tf` is hardcoded text.
+
+The migration itself: `terraform init -migrate-state`, then a fresh
+`terraform plan` reporting **no changes** — proof the move was lossless.
+
+### Step 2: CI identity — how GitHub deploys with no keys anywhere
+
+`infra/ci.tf` teaches AWS to trust GitHub's OIDC token signer, then
+defines a role whose trust policy accepts only tokens saying "I am a
+workflow run of jgarc826/StudyBuddy-Timer, on main or as a PR check".
+The workflow trades that token for AWS credentials that die with the
+job. Nothing to store, nothing to leak, nothing to rotate — the CI twin
+of `aws login`.
+
+**Least privilege, honestly (hard rule 7):** this role runs `terraform
+apply`, so it must manage every resource in the project — far broader
+than the Lambda's two-action role, but fenced to this project's named
+resources wherever AWS allows. Two grants could not be fenced and are
+the documented exceptions: **CloudFront** (several control-plane actions
+don't support resource-level scoping at all) and **API Gateway** (its
+control plane uses path-style ARNs with no stable id before creation) —
+both wildcard-scoped but harmless *in this account*, which contains only
+this project. Also worth knowing: renaming the GitHub repo breaks the
+trust condition — update `local.github_repo` in ci.tf in the same
+change.
+
+### Step 3: the pipelines (.github/workflows/)
+
+- **checks.yml** (pull requests): unit tests, `terraform fmt -check`,
+  `validate`, and `plan` — a read-only preview of what the change would
+  do to AWS, printed into the PR.
+- **deploy.yml** (push to main): tests, `terraform apply`, site deploy.
+  A failing test stops the deploy cold. `-auto-approve` appears here and
+  is *not* a violation of the "never -auto-approve" rule: that rule
+  covers interactive use on a human's machine; in CI the plan gate lives
+  in the PR workflow, and a `concurrency` group plus the state lock keep
+  applies from overlapping. `terraform_wrapper: false` in the setup
+  action matters — the wrapper garbles `terraform output -raw`, which
+  the deploy script depends on.
+
+### Step 4: monitoring
+
+- **SNS topic + email subscription**: CloudWatch publishes alarm state
+  changes; the email subscribes. AWS sends a confirmation link that a
+  human must click once — Terraform cannot consent on your behalf.
+- **The alarm** watches the Lambda `Errors` metric (invocations that
+  crashed). Our handler catches everything and answers 500 instead, so
+  this metric staying at zero is meaningful: the alarm firing means
+  something *truly* unexpected — a bad deploy, a runtime failure.
+  `treat_missing_data = "notBreaching"` because no traffic produces no
+  data, and healthy silence must not page anyone.
+- **The dashboard** (CloudWatch → Dashboards → studybuddy-timer): Lambda
+  invocations/errors, duration (average and p95), API request count, and
+  4xx vs 5xx.
+
+### Loose ends, stated honestly
+
+- The **destroy → apply rebuild test** from the stage's "done when" was
+  NOT run: the project rules require an explicit request before any
+  `terraform destroy` (it deletes all stored sessions). The system is
+  built for it (separate state, force_destroy on the site bucket,
+  deterministic names) — ask and it runs.
+- The **alarm email** stays "pending" until the confirmation link is
+  clicked; after that, `aws cloudwatch set-alarm-state` can fire a test
+  notification without breaking anything.
+- Local AWS access still uses the account **root** via `aws login`;
+  creating an IAM admin user for daily work remains the standing
+  cleanup.
+
+### How to verify Stage 4 yourself
+
+1. GitHub → the repo → **Actions**: the push that added these workflows
+   ran "deploy" — tests, a no-op apply, and a site deploy, end to end.
+2. Open a toy pull request (change a comment): "checks" runs and the
+   plan step prints "No changes." Close it without merging.
+3. S3 → `studybuddy-timer-tfstate-…` → `app/terraform.tfstate` exists;
+   the bucket shows versioning **Enabled**.
+4. Click the link in the "AWS Notification - Subscription Confirmation"
+   email, then force a test alarm:
+   `aws cloudwatch set-alarm-state --alarm-name studybuddy-timer-lambda-errors --state-value ALARM --state-reason test` —
+   an email arrives; the alarm resets itself within minutes (and mails
+   an OK).
+5. CloudWatch → Dashboards → **studybuddy-timer** shows real traffic
+   from your own use of the site.
+
+### Five interview questions about Stage 4
+
+1. **"Why move Terraform state to S3, and what protects it there?"**
+   CI and the laptop must share one memory of what exists, or they'd
+   fight. The bucket adds versioning (roll back a corrupted state) and
+   lockfile locking (two applies can't interleave). And it's created by
+   a separate bootstrap config, because a config that owns its own state
+   bucket can't cleanly destroy itself.
+
+2. **"How does CI authenticate to AWS without stored secrets?"** OIDC
+   federation: GitHub signs a short-lived token naming the exact repo
+   and branch of the run; AWS trusts GitHub's signer; a role's trust
+   policy accepts only this repo's main branch and PR checks; the job
+   trades the token for credentials that expire with the job. There is
+   no key to steal — compare that to a leaked long-lived access key,
+   which works for anyone, from anywhere, until someone notices.
+
+3. **"You forbid -auto-approve locally but use it in CI. Hypocrisy?"**
+   No — the rule's purpose is "a human reads the diff before it
+   happens". Locally that's me reading the plan. In CI the human read
+   the plan in the pull request; the merge *is* the approval, and main
+   deploys exactly what was reviewed. CI has no keyboard for a prompt,
+   so an interactive apply there would just hang forever.
+
+4. **"What does your alarm actually tell you?"** That an invocation
+   *crashed* — not that a user typo'd a request. The handler converts
+   expected failures into 4xx/500 responses, so the Errors metric is
+   reserved for the unexpected: a bad deploy, a broken runtime
+   assumption. Missing data counts as healthy because an idle hobby API
+   produces silence, and silence shouldn't page anyone at 3 a.m.
+
+5. **"Where did least-privilege get uncomfortable, and what did you
+   do?"** The CI role — it runs terraform apply, so it must manage
+   everything the project owns. The answer was fencing by *name*: every
+   grant is scoped to this project's ARNs except two AWS won't allow
+   (CloudFront's and API Gateway's control planes), which are documented
+   as accepted, account-local wildcards. The contrast on the same page:
+   the Lambda role, which needs — and has — exactly two actions on one
+   table.
+
+## The project is complete
+
+All four stages are built, deployed, documented, and verified. Later
+phases (Cognito accounts, then friends) start from a data model and an
+identity header that were designed for them on day one.
