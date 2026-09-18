@@ -348,3 +348,69 @@ distribution changes nothing here.
 - **`cd "$(dirname "$0")/.."`** — "go to the repo root relative to where
   this script file lives", so the script works no matter which directory
   you call it from.
+
+### How to verify Stage 2 yourself
+
+1. `terraform -chdir=infra output site_url` prints the site's address —
+   open it: the timer loads over HTTPS and works exactly like the local
+   copy (try `?fast=1`). Note this is a *different origin* than your local
+   file, so it starts with fresh, empty localStorage.
+2. Try to bypass CloudFront: open
+   `https://studybuddy-timer-site-719857072816.s3.us-east-1.amazonaws.com/index.html`
+   — S3 answers **403 Access Denied**. The bucket refuses everyone except
+   our distribution; the *only* door to the files is CloudFront.
+3. Change one visible thing in `site/`, run `./scripts/deploy.sh`, refresh
+   the site: the change appears within a few seconds (that's the
+   invalidation doing its job).
+4. `terraform plan` again prints "No changes" — reality matches the code.
+
+### Five interview questions about Stage 2
+
+1. **"The bucket is private — so how is the site public?"**
+   The public surface is CloudFront, not S3. CloudFront cryptographically
+   signs its fetches to the bucket (Origin Access Control, SigV4), and the
+   bucket policy admits only requests signed by *our specific
+   distribution* (`AWS:SourceArn` condition — which also stops another AWS
+   customer from pointing *their* CloudFront at our bucket, the classic
+   "confused deputy" trick). Plus a Public Access Block refuses any future
+   attempt to make the bucket public by mistake.
+
+2. **"You deployed a new version but users still see the old one. Why,
+   and what do you do?"**
+   Edge servers cache files (up to 24 h under our cache policy). The
+   deploy script therefore ends with a `/*` invalidation — an order to
+   every edge to refetch. The industry alternative is *versioned
+   filenames* (`app.3f9c.js`): a new name is never cached stale, and big
+   sites prefer it because invalidations aren't instant and only 1,000
+   paths/month are free. At our scale, invalidation is simpler and fine.
+
+3. **"Why Terraform instead of clicking in the AWS console?"**
+   The console is fast once and irreproducible forever: no history, no
+   review, no rebuild. As code, the infrastructure is versioned, diffable
+   (`terraform plan` before every change), and rebuildable from scratch —
+   Stage 4 literally tests `destroy` → `apply`. Clicked infra also drifts:
+   nobody remembers why a setting is what it is. Here the files *are* the
+   documentation.
+
+4. **"What is the Terraform state file, and why isn't it in git?"**
+   It's Terraform's memory: a JSON map from resource names in code to real
+   AWS resource ids, refreshed on each run to detect drift. It's not
+   committed because it can embed secrets in plain text and because two
+   people applying from different copies would corrupt each other's view —
+   Stage 4 moves it to S3 with locking so CI and I share one copy safely.
+
+5. **"Why does the bucket name end with your account id?"**
+   S3 bucket names are unique across *all AWS customers worldwide* (they
+   become DNS hostnames), so `studybuddy-timer-site` alone could collide
+   with anyone. Suffixing the account id makes it unique yet
+   *deterministic* — a destroy/rebuild gets the same name back, unlike a
+   random suffix.
+
+### What Stage 3 adds
+
+The backend: a DynamoDB table for sessions, a Lambda function (Node.js)
+behind an API Gateway HTTP API with CORS and throttling — all in
+Terraform — plus unit tests, and `site/storage.js` swaps its internals
+from localStorage to `fetch()` calls against that API. The interface
+stays identical, so app.js doesn't change: that was the point of freezing
+the async contract in Stage 1.
