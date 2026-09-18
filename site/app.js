@@ -148,7 +148,16 @@ function advance(now) {
   let changed = false;
   while (timer.running && now >= timer.endsAt) {
     if (timer.phase === 'focus') {
-      // Focus block completed. (The next commit saves it as a session here.)
+      // Focus block completed -> record it as a study session. Built BEFORE
+      // the timer object is mutated below. recordSession is async and is
+      // deliberately not awaited: advance() stays a plain synchronous
+      // function, and the save finishes on its own a moment later.
+      recordSession({
+        sessionId: timer.sessionId,
+        startedAt: timer.startedAt,
+        minutes: timer.minutes,
+        localDate: toLocalDateString(new Date(timer.startedAt)),
+      });
       // The break starts when focus ENDED, not at `now` — come back three
       // minutes late and three minutes of your break are already gone.
       timer.phase = 'break';
@@ -162,7 +171,58 @@ function advance(now) {
   if (changed) saveTimerState();
 }
 
-/* ===== 5. Rendering ==================================================== */
+/* ===== 5. Study sessions & the history panel =========================== */
+
+// "2026-09-18" in the USER'S OWN timezone, built by hand on purpose:
+// date.toISOString() would give the UTC date, which in the evening in
+// California is already tomorrow — sessions would land on the wrong grid
+// square. (Two JS surprises: getMonth() is 0-based, getDate() is 1-based.)
+function toLocalDateString(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/*
+  async / await in one breath: an `async function` returns immediately with
+  a Promise — a handle to a result that isn't ready yet, like a std::future.
+  Inside one, `await x` parks THIS function until x resolves while the rest
+  of the page keeps running; no blocked thread, no callback pyramid.
+  StudyStorage's functions are async because in Stage 3 they become network
+  calls. Today they happen to resolve instantly.
+*/
+async function recordSession(session) {
+  try {
+    await StudyStorage.saveSession(session);  // 'created' or 'duplicate' — both fine
+    await refreshStats();
+  } catch (err) {
+    // Log it and carry on: a storage hiccup should never kill the timer.
+    console.error('Could not save the session:', err);
+  }
+}
+
+// Re-read all sessions and redraw the history panel. (For now: the total
+// line. The contribution grid joins in the next commit.)
+async function refreshStats() {
+  const sessions = await StudyStorage.loadSessions();
+  renderTotal(sessions);
+}
+
+function renderTotal(sessions) {
+  // reduce is std::accumulate: fold the array into one running value.
+  const totalMinutes = sessions.reduce((sum, s) => sum + s.minutes, 0);
+  if (totalMinutes === 0) {
+    els.totalLine.textContent = 'No sessions yet — press Start!';
+    return;
+  }
+  const hours = (totalMinutes / 60).toFixed(1);  // e.g. "12.5"
+  const n = sessions.length;
+  els.totalLine.textContent =
+    `${hours} hours studied · ${n} session${n === 1 ? '' : 's'}`;
+}
+
+/* ===== 6. Rendering ==================================================== */
 
 // Grab every element once, by id — a handle to the live page element, much
 // like holding a widget pointer in a GUI toolkit.
@@ -174,6 +234,7 @@ const els = {
   pauseBtn: document.getElementById('pause-btn'),
   resetBtn: document.getElementById('reset-btn'),
   testBadge: document.getElementById('test-badge'),
+  totalLine: document.getElementById('total-line'),
 };
 
 // 3,000,000 ms at 60,000 ms/minute -> "50:00". In fast mode one nominal
@@ -235,7 +296,7 @@ function render() {
     : `${clockText} · ${timer.phase === 'focus' ? 'Focus' : 'Break'} — StudyBuddy`;
 }
 
-/* ===== 6. Wiring & startup ============================================= */
+/* ===== 7. Wiring & startup ============================================= */
 
 // The heartbeat, ~4x per second. Advancing BEFORE rendering means the tick
 // that crosses the finish line already draws the next phase.
@@ -284,4 +345,7 @@ if (restored) {
 }
 
 render();
+// Draw the history panel from whatever is already stored. The .catch is the
+// safety net for a rejected Promise (an exception in async clothing).
+refreshStats().catch(err => console.error('Could not load history:', err));
 setInterval(tick, 250);  // "call tick() every 250 ms", forever

@@ -99,3 +99,61 @@ state, so it can't drift out of sync.
   identify each session.
 - **`URLSearchParams`** — parser for the `?key=value` part of a URL; how the
   page notices `?fast=1`.
+
+### Step 3: saving sessions (`site/storage.js`) and total hours
+
+**What was created:** a completed focus block is now saved as a session,
+and the history card shows total hours + session count. All storage goes
+through a new module, `site/storage.js`, which exposes exactly two
+functions: `StudyStorage.saveSession(session)` and
+`StudyStorage.loadSessions()`. Nothing else in the app knows where the
+data lives.
+
+**Why a separate file:** Stage 3 replaces localStorage with our real API.
+Because app.js only talks to this two-function interface, that swap will
+change one file and nothing else — like programming against an abstract
+base class and swapping the implementation.
+
+**Why the functions are `async` when localStorage is instant:** network
+calls are coming in Stage 3, and callers of a network call must `await`.
+Freezing the async contract *now* means call sites never change later.
+
+**What a session looks like** (deliberately the exact JSON the Stage 3
+API will accept — the shape is already frozen):
+
+```json
+{ "sessionId": "ba19ff37-...", "startedAt": "2026-09-18T20:52:22.330Z",
+  "minutes": 50, "localDate": "2026-09-18" }
+```
+
+**Decisions made in this step:**
+
+- *The `sessionId` is chosen when the block STARTS, not when it ends.* The
+  id travels with the timer state, so a refresh, a retry, or two open tabs
+  finishing the same block all present the SAME id — and `saveSession` is
+  idempotent: a duplicate id is stored once and reported as `'duplicate'`.
+  This is the browser-side twin of the Stage 3 rule "write only if this
+  item doesn't already exist" (a DynamoDB conditional write), and the
+  return values already mirror the API's future replies (201/200).
+- *`localDate` comes from when the block started*, in the user's own
+  timezone. A block started at 11:40 pm belongs to the day you sat down.
+  It's computed by hand from `getFullYear/getMonth/getDate` because the
+  tempting `toISOString().slice(0, 10)` gives the **UTC** date — wrong for
+  an evening study session in California.
+- *In fast mode a completed block still records `minutes: 50`* — the point
+  of test mode is to see real numbers appear quickly. Test data can be
+  wiped with `localStorage.clear()` in the browser console (F12).
+
+**Terms that appear in this step:**
+
+- **Promise** — a handle to a result that isn't ready yet; close cousin of
+  `std::future`. `await` parks the current async function until the result
+  arrives, while the rest of the page keeps running. There is still only
+  ONE thread — `async` is cooperative scheduling, not threading.
+- **IIFE** — `(function () { ... })()`: define a function, call it
+  immediately. Variables inside are private; the returned object is the
+  public interface, and its methods reach the private variables through
+  their closure. The pre-modules way to build a module — used in
+  storage.js and worth being able to explain in an interview.
+- **`Array.prototype.reduce` / `some`** — `std::accumulate` and
+  `std::any_of` for JS arrays.

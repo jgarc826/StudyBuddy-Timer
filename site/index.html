@@ -44,7 +44,10 @@
   </main>
 
   <!-- Behavior lives in separate files, loaded at the END of <body> so that
-       every element above already exists when the script runs. -->
+       every element above already exists when the scripts run. Order
+       matters, like link order: storage.js defines StudyStorage, which
+       app.js uses. -->
+  <script src="storage.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
