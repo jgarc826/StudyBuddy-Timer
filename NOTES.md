@@ -326,3 +326,25 @@ misses, authenticated via **Origin Access Control**.
   request originates from our distribution's ARN).
 - **ARN** — Amazon Resource Name, the globally unique id every AWS
   resource has.
+
+### Step 2: the deploy script (`scripts/deploy.sh`)
+
+**What it does:** two commands, glued together. `aws s3 sync site/ s3://…
+--delete` uploads changed files and removes remote ones that no longer
+exist locally, so the bucket exactly mirrors `site/`. Then `aws cloudfront
+create-invalidation --paths "/*"` tells every edge server to forget its
+cached copies, so the new version is visible immediately instead of
+"within a day, whenever caches expire". Both names come from `terraform
+output` — the script has zero hardcoded values, so a rebuilt bucket or
+distribution changes nothing here.
+
+**Shell-script terms worth knowing (they come up in interviews too):**
+
+- **`set -euo pipefail`** — the standard bash safety trio: stop on the
+  first error, treat unset variables as errors, and let a failure anywhere
+  in a pipeline fail the pipeline.
+- **`$(...)`** — command substitution: run the command, paste its output
+  into place (like capturing a subprocess's stdout).
+- **`cd "$(dirname "$0")/.."`** — "go to the repo root relative to where
+  this script file lives", so the script works no matter which directory
+  you call it from.
