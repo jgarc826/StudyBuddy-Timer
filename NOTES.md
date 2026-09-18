@@ -259,3 +259,70 @@ CloudFront (the CDN that serves them over HTTPS), wired with Origin Access
 Control so the bucket itself stays sealed, plus a deploy script. The app's
 code won't change — Stage 2 is purely about hosting these same three files
 on the internet.
+
+## Stage 2 — putting the site on the internet
+
+### Step 1: the hosting, described in Terraform (`infra/`)
+
+**The mental model:** Terraform is *declarative*. The `.tf` files describe
+the end state ("this bucket exists, configured like so"); `terraform plan`
+diffs that against reality and shows what it would create/change/destroy;
+`terraform apply` executes the diff. The *state file* (`terraform.tfstate`,
+gitignored) is Terraform's memory of what it made — like a build cache.
+Nothing in these files is ever clicked together in the AWS console, so the
+whole system can be rebuilt from source.
+
+**The architecture in one sentence:** visitors hit **CloudFront** (AWS's
+network of edge servers — nearby, fast, HTTPS), which serves cached copies
+of the site and refetches from a **private S3 bucket** only on cache
+misses, authenticated via **Origin Access Control**.
+
+**What each file declares:**
+
+- `versions.tf` — pins Terraform ≥ 1.13 and AWS provider 6.x. The
+  `.terraform.lock.hcl` file (committed on purpose) records the provider's
+  cryptographic hashes, so every machine builds with the exact same plugin
+  — same idea as a package-lock file.
+- `providers.tf` — region `us-east-1`, a default tag on everything we
+  create, and a lookup of our own account id.
+- `s3.tf` — the bucket (name suffixed with the account id, because bucket
+  names are globally unique across all AWS customers), a *public access
+  block* (refuses any form of public exposure, even future accidental
+  ones), and the *bucket policy*: the CloudFront service may `GetObject`
+  and `ListBucket`, **only** when the request comes from our specific
+  distribution (`AWS:SourceArn` condition). ListBucket exists so missing
+  files return an honest 404 instead of a stonewalling 403.
+- `cloudfront.tf` — the Origin Access Control (the signing identity that
+  matches the bucket policy), and the distribution: HTTPS on the default
+  `*.cloudfront.net` certificate, HTTP redirected to HTTPS, GET/HEAD only,
+  compression on, AWS's managed "CachingOptimized" cache policy (looked up
+  by name via a data block instead of pasting its UUID), cheapest price
+  class (edges in North America + Europe).
+- `outputs.tf` — the site URL, bucket name, and distribution id, printed
+  after apply and read by the deploy script so nothing is hardcoded.
+
+**Decisions made in this step:**
+
+- `force_destroy = true` on the bucket: `terraform destroy` may delete it
+  even with files inside — safe because the contents are redeployable
+  copies of `site/`, and Stage 4 requires clean destroy→apply rebuilds.
+- Local Terraform state for now; Stage 4 moves it to S3 for CI.
+- No CloudFront access logs (extra bucket + cost; metrics are free).
+- Signed in via `aws login` as the account **root** user for now — works,
+  short-lived credentials, but the to-do stands: create an IAM admin user
+  for daily work and keep root for account-level tasks only.
+
+**Terms:**
+
+- **IaC (infrastructure as code)** — infrastructure defined in reviewable,
+  versioned text instead of console clicks.
+- **CDN / edge / cache miss** — servers near users holding copies; a miss
+  falls through to the origin (our bucket).
+- **Origin Access Control (OAC)** — CloudFront signs its S3 requests
+  (SigV4); the bucket accepts only those signatures. Private bucket,
+  public site.
+- **Bucket policy / principal / condition** — *who* (principal:
+  `cloudfront.amazonaws.com`) may do *what* (actions) *when* (condition:
+  request originates from our distribution's ARN).
+- **ARN** — Amazon Resource Name, the globally unique id every AWS
+  resource has.
