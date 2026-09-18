@@ -414,3 +414,58 @@ Terraform — plus unit tests, and `site/storage.js` swaps its internals
 from localStorage to `fetch()` calls against that API. The interface
 stays identical, so app.js doesn't change: that was the point of freezing
 the async contract in Stage 1.
+
+## Stage 3 — the backend
+
+### Step 1: the Lambda code (`backend/`) and its unit tests
+
+**Runtime choice, checked not assumed:** AWS's runtime table lists
+`nodejs24.x` as the newest generally-available Node.js runtime (26 exists
+only as a "not for production" preview), so the function targets
+`nodejs24.x` and the Mac got a matching Node 24 (userland install, no
+admin). One caveat noted from the same page: AWS *recommends* bundling
+the SDK rather than relying on the runtime's copy; the brief deliberately
+chooses the runtime copy to keep the zip dependency-free, and that
+trade-off (simplicity now, version drift risk later) is worth being able
+to defend in an interview.
+
+**The architecture of `backend/src/` — a seam for testability:**
+
+- `index.mjs` — the only file Lambda calls. One job: plug the *real*
+  DynamoDB store into the handler. Runs once per cold start.
+- `handler.mjs` — routing, validation, responses. Knows nothing about
+  DynamoDB; it receives "a store" through `makeHandler(store)` —
+  dependency injection, like a C++ constructor taking an abstract
+  interface. Unit tests inject a fake store; production injects the real
+  one. This is the split the brief demanded ("request handling separate
+  from DynamoDB calls").
+- `store.mjs` — the only file that imports the AWS SDK. Two operations:
+  a conditional put and a range query.
+- `validation.mjs` / `keys.mjs` — pure functions, no I/O: validators and
+  the single-table key scheme.
+
+**Server-side rules worth remembering:**
+
+- *Never trust the browser.* Every field is validated (UUID shapes, real
+  calendar dates — `2026-02-31` is refused, ISO timestamps, integer
+  minutes 1–180), bodies over 2 KB are refused, and the stored object is
+  **rebuilt from validated fields only**, so extra JSON fields a caller
+  smuggles in are dropped, never stored.
+- *Idempotent writes, now atomic.* `attribute_not_exists(PK)` makes
+  DynamoDB itself refuse a second write of the same session — the
+  server-grade version of the duplicate check the browser has had since
+  Stage 1. Handler answers 201 on create, 200 on duplicate — the same
+  contract `storage.js` has spoken all along.
+- *The date filter is a string trick with a proof.* Sort keys embed the
+  date first (`SESSION#2026-09-18#<uuid>`), and zero-padded dates sort
+  alphabetically in date order, so "sessions since X" is a sorted-range
+  walk (`SK >= "SESSION#X"`), not a scan-and-filter. `keys.test.mjs`
+  pins the property down across month/year boundaries.
+- *Errors leak nothing.* Unexpected failures log details to CloudWatch
+  and answer only `500 {"message":"Internal error"}`.
+
+**Tests: 35, in Node's built-in runner** (`node --test
+backend/test/*.test.mjs` — no framework installed). They cover the
+brief's three required areas — validation (every field, both directions),
+the duplicate-session case, and the date filter — plus routing, size
+limits, base64-encoded bodies, field smuggling, and the 500 path.
