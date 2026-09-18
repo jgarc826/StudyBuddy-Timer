@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!--
+  StudyBuddy — Stage 1.
+  This file is the page's STRUCTURE only. Looks live in style.css;
+  behavior arrives in separate .js files in later commits.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- On phones: render at device width instead of pretending to be a desktop. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StudyBuddy</title>
+  <!-- Tab icon embedded as a data: URL, so no extra image file is needed. -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="page">
+    <header class="page-header">
+      <h1>StudyBuddy</h1>
+      <!-- Shown only in ?fast=1 test mode; JavaScript un-hides it. -->
+      <span id="test-badge" class="test-badge" hidden>test mode — minutes are seconds</span>
+    </header>
+
+    <!-- The timer. The id attributes are unique handles; JavaScript finds
+         elements by id, like looking up a widget in a GUI toolkit. -->
+    <section class="card timer-card" aria-label="Timer">
+      <p id="phase-label" class="phase-label">Ready to focus</p>
+      <p id="clock" class="clock">50:00</p>
+      <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+      <div class="controls">
+        <button id="start-btn" type="button" class="btn btn-primary">Start</button>
+        <button id="pause-btn" type="button" class="btn" disabled>Pause</button>
+        <button id="reset-btn" type="button" class="btn" disabled>Reset</button>
+      </div>
+    </section>
+
+    <!-- Study history. Later commits fill this in: total hours, then the
+         contribution grid. -->
+    <section class="card history-card" aria-label="Study history">
+      <h2>Your history</h2>
+      <p id="total-line" class="total-line">No sessions yet.</p>
+    </section>
+  </main>
+</body>
+</html>

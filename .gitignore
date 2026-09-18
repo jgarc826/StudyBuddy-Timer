@@ -1,0 +1,26 @@
+# Files git should never track. Each block exists for a reason — see NOTES.md.
+
+# --- macOS / editor noise ---
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# --- Node.js (arrives in Stage 3; ignored ahead of time) ---
+# Installed packages. Recreated from package.json, so never committed.
+node_modules/
+
+# --- Terraform (arrives in Stage 2) ---
+# Downloaded providers and modules — large and machine-specific.
+.terraform/
+# State files record real AWS resource IDs and can contain secrets.
+# They must never be committed. (Stage 4 moves state into S3 instead.)
+*.tfstate
+*.tfstate.*
+crash.log
+# Variable files can hold values that shouldn't be public.
+*.tfvars
+
+# --- Local environment files (secrets by convention) ---
+.env
+.env.*
