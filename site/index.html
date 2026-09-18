@@ -61,8 +61,9 @@
 
   <!-- Behavior lives in separate files, loaded at the END of <body> so that
        every element above already exists when the scripts run. Order
-       matters, like link order: storage.js defines StudyStorage, which
-       app.js uses. -->
+       matters, like link order: config.js defines the API URL, storage.js
+       uses it to define StudyStorage, and app.js uses that. -->
+  <script src="config.js"></script>
   <script src="storage.js"></script>
   <script src="app.js"></script>
 </body>

@@ -519,3 +519,119 @@ items can exist under the current writer and IAM, and that plausible
 future key layouts sort *before* the range anyway. Good instinct, not a
 defect — which is precisely why findings get cross-examined before
 anyone acts on them.
+
+### Step 3: the infrastructure (11 new resources, one apply)
+
+Terraform added, alongside the Stage-2 resources: the DynamoDB table
+(on-demand billing), the Lambda function (nodejs24.x on ARM, 128 MB,
+code zipped straight from `backend/src` by the `archive` provider), its
+IAM role — allowed exactly `PutItem` + `Query` on exactly one table, plus
+writing to one log group we create ourselves so the 14-day retention rule
+applies — and the HTTP API: two routes, CORS naming only the CloudFront
+site and `localhost:8123`, and stage throttling at 5 req/s. Everything
+verified live with curl before the frontend was touched: 201 on create,
+200 on the retry, 400s with named reasons, and unknown routes rejected
+by the gateway before Lambda ever runs.
+
+### Step 4: the storage swap — app.js untouched
+
+`site/storage.js` got new internals behind the same two-function
+interface; `app.js` did not change by one character. That is the Stage-1
+bet paying off: the interface was async before it needed to be, so the
+arrival of a real network changed nothing for the callers.
+
+New pieces:
+
+- **`config.js`** holds the API's base URL (printed by `terraform
+  output`). Not a secret — it's where every visitor's browser talks
+  anyway.
+- **Identity**: first visit invents a UUID, keeps it in localStorage,
+  sends it as `X-User-Id` on every call. Anyone holding the ID can read
+  and write that history — phase 2's accounts replace this.
+- **`fetch()`** — the browser's HTTP client. Two awaits per request: one
+  for the response headers, one for the body (which may still be
+  streaming).
+- **An offline queue**: a session that can't reach the API is stored
+  locally and re-sent on the next opportunity, and still shows on the
+  grid meanwhile. Safe *because* the server is idempotent — a retry of a
+  delivered session is a harmless 200. Server-*rejected* (4xx) sessions
+  are dropped from the queue instead of retrying forever — an important
+  distinction: "the network failed" is temporary, "the server said no"
+  is permanent.
+
+**Consequences worth knowing:**
+
+- Opening `index.html` from disk (file://) still runs the timer but
+  can't reach the API: browsers send `Origin: null` from local files and
+  CORS rightly refuses it. Local development = `http://localhost:8123`.
+- Old Stage-1/2 sessions living in localStorage under
+  `studybuddy.sessions.v1` are ignored, not migrated — ours were all
+  fast-mode test data. (If real data had existed, the migration would be
+  one loop POSTing each old session — idempotency makes it re-runnable.)
+- "Total hours" now covers the last ~400 days (the server's `from`
+  window), no longer "all time". At real usage nothing changes for over
+  a year; a lifetime-total would later come from a small aggregate item
+  rather than rereading every session forever.
+
+### How to verify Stage 3 yourself
+
+1. `node --test backend/test/*.test.mjs` → 43 passing.
+2. On the live site with `?fast=1`, finish a focus block, then in
+   DevTools → Network watch `POST /sessions` return 201 — and reload the
+   page: the grid comes back from the API (`GET /sessions`), not from
+   localStorage.
+3. In the AWS console (DynamoDB → studybuddy-timer-sessions → Explore
+   items) your session is there: `PK USER#<your id>`,
+   `SK SESSION#<date>#<session id>`.
+4. Idempotency, from the browser console:
+   `await StudyStorage.saveSession((await StudyStorage.loadSessions())[0])`
+   answers `'duplicate'`, and the item count doesn't change.
+5. `curl` the API without an `X-User-Id` header → 400 with a clear
+   message; with minutes 999 → 400; from 2020 → 400.
+
+### Five interview questions about Stage 3
+
+1. **"How do you guarantee a session is never counted twice, end to
+   end?"** The id is minted when the focus block *starts* and rides
+   through every layer. The browser retries with the same id; the server
+   writes with `attribute_not_exists` so DynamoDB itself refuses a
+   second copy atomically; the response distinguishes 201 from 200 so a
+   retry looks like success to the client. No layer trusts the previous
+   one to have deduplicated.
+
+2. **"The user finishes a session on hotel Wi-Fi and the POST fails.
+   What happens?"** The storage module distinguishes *network failure*
+   (fetch threw — queue the session locally, show it on the grid, retry
+   on the next load) from *server rejection* (4xx — never retry, it will
+   never become valid). Queued sessions survive restarts, and retries
+   are safe because of the idempotency above.
+
+3. **"Why does the Lambda's role have two actions on one table?"** Least
+   privilege: the code performs exactly a conditional put and a query,
+   so that's the entire grant. If the function is ever compromised, the
+   blast radius is those two operations on that table — no S3, no other
+   tables, not even DynamoDB deletes.
+
+4. **"How does the history query stay fast and cost-bounded?"** Three
+   layers: the sort key embeds the date, so "since X" is a sorted range
+   *query* (not a scan-and-filter); the API refuses `from` older than
+   400 days; and the store stops reading at 6,000 items. The last two
+   exist because a review showed an attacker could otherwise bloat a
+   partition and turn each GET into thousands of billed read units the
+   request throttle can't see.
+
+5. **"The browser already validates input. Why validate again on the
+   server?"** Because the API is a public URL and the browser is just
+   one possible caller — curl doesn't run our JavaScript. The server is
+   the only place validation is *enforceable*; the browser's copy is
+   merely good UX. Corollary: the server also rebuilds objects from
+   validated fields only, so unknown JSON keys never reach the database.
+
+### What Stage 4 adds
+
+Automation and operations: Terraform state moves to S3 so CI can share
+it; GitHub Actions runs tests/fmt/validate/plan on pull requests and
+apply+deploy on main (authenticated with an OIDC role, no stored keys);
+a CloudWatch alarm emails on Lambda errors, plus a small dashboard; and
+the README with architecture diagram, costs, limits, and the honest
+section on how AI tools were used and verified.
