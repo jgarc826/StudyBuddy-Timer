@@ -1,4 +1,4 @@
-# StudyBuddy — build notes
+# StudyBuddy Timer — build notes
 
 A plain-language log of what was built and why, written for a C++ programmer
 who is new to web development. One section per step. Each stage ends with a

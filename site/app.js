@@ -364,8 +364,8 @@ function render() {
   // Mirror the countdown into the tab's title so it's visible while the
   // tab is in the background.
   document.title = timer.phase === 'idle'
-    ? 'StudyBuddy'
-    : `${clockText} · ${timer.phase === 'focus' ? 'Focus' : 'Break'} — StudyBuddy`;
+    ? 'StudyBuddy Timer'
+    : `${clockText} · ${timer.phase === 'focus' ? 'Focus' : 'Break'} — StudyBuddy Timer`;
 }
 
 /* ===== 7. Wiring & startup ============================================= */

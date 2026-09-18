@@ -1,4 +1,4 @@
-# StudyBuddy (working title): project brief
+# StudyBuddy Timer: project brief
 
 This file is the brief for the whole project. Read it fully at the start of every session.
 
