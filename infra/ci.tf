@@ -21,7 +21,11 @@ resource "aws_iam_openid_connect_provider" "github" {
 }
 
 locals {
-  github_repo      = "jgarc826/StudyBuddy-Timer" # renaming the repo breaks CI auth — update this too
+  github_repo = "jgarc826/StudyBuddy-Timer"
+  # GitHub's stable numeric ids for the owner and repo (visible in the
+  # OIDC sub claim, or via the GitHub API). Unlike the names, these
+  # survive account and repository renames.
+  github_repo_ids  = "jgarc826@117320647/StudyBuddy-Timer@1376436134"
   state_bucket_arn = "arn:aws:s3:::studybuddy-timer-tfstate-${data.aws_caller_identity.current.account_id}"
   account_id       = data.aws_caller_identity.current.account_id
 }
@@ -43,10 +47,19 @@ data "aws_iam_policy_document" "github_actions_assume" {
 
     # The heart of the trust: only workflow runs FOR THIS REPO, and only
     # on main or as a pull-request check, may assume the role.
+    #
+    # Two formats per case, learned the hard way: GitHub embeds stable
+    # numeric ids in the sub claim ("owner@id/repo@id"), which CloudTrail
+    # revealed after the name-only form was refused on the first deploys.
+    # The id-bearing entries are the ones matching today — and they keep
+    # working across renames; the name-only entries are kept in case the
+    # claim format ever reverts.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
+        "repo:${local.github_repo_ids}:ref:refs/heads/main",
+        "repo:${local.github_repo_ids}:pull_request",
         "repo:${local.github_repo}:ref:refs/heads/main",
         "repo:${local.github_repo}:pull_request",
       ]

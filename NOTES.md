@@ -708,6 +708,33 @@ change.
   invocations/errors, duration (average and p95), API request count, and
   4xx vs 5xx.
 
+### Postmortem: why the first two deploys failed
+
+The pipeline's first runs died at the AWS handshake: `Not authorized to
+perform sts:AssumeRoleWithWebIdentity`. First hypothesis — IAM's
+eventual consistency (the role was two minutes old) — was **wrong**: a
+retry an hour later failed identically.
+
+The actual tool for this job was **CloudTrail** (AWS's audit log, on by
+default): looking up the rejected `AssumeRoleWithWebIdentity` events
+showed the *exact* subject GitHub presented:
+
+```
+repo:jgarc826@117320647/StudyBuddy-Timer@1376436134:ref:refs/heads/main
+```
+
+GitHub embeds **stable numeric ids** in its OIDC sub claims
+(`owner@id/repo@id`) — a defense against name-reuse attacks — while the
+trust policy expected the classic name-only form. No amount of waiting
+fixes a string mismatch. The fix pins the numeric ids (which, as a
+bonus, survive account and repo renames — names don't) and keeps the
+name-only patterns as fallback.
+
+Two lessons worth repeating in an interview: when an identity system
+says no, *go read what was actually presented* instead of re-reading
+what you configured; and the audit log, not the error message, is where
+that evidence lives.
+
 ### Loose ends, stated honestly
 
 - The **destroy → apply rebuild test** from the stage's "done when" was
