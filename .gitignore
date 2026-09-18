@@ -1,6 +1,7 @@
 # Files git should never track. Each block exists for a reason — see NOTES.md.
 
-# --- macOS / editor noise ---
+# --- macOS / editor / AI-tooling noise ---
+.claude/
 .DS_Store
 *.swp
 .vscode/
