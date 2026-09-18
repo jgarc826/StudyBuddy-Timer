@@ -28,6 +28,12 @@ export function fromBoundSK(fromDate) {
   return `SESSION#${fromDate}`;
 }
 
+// Prefix shared by every session of one calendar day — used with
+// begins_with() to count a day's sessions when enforcing the daily cap.
+export function dayPrefixSK(localDate) {
+  return `SESSION#${localDate}#`;
+}
+
 // A stored item carries PK/SK plus the payload fields; callers only get
 // the payload back, never our internal key layout.
 export function sessionFromItem(item) {

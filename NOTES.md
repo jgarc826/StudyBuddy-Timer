@@ -464,8 +464,58 @@ to defend in an interview.
 - *Errors leak nothing.* Unexpected failures log details to CloudWatch
   and answer only `500 {"message":"Internal error"}`.
 
-**Tests: 35, in Node's built-in runner** (`node --test
-backend/test/*.test.mjs` — no framework installed). They cover the
+**Tests: 43, in Node's built-in runner** (`node --test
+backend/test/*.test.mjs` — no framework installed; note the glob, because
+passing the bare directory runs zero tests on Node 24). They cover the
 brief's three required areas — validation (every field, both directions),
 the duplicate-session case, and the date filter — plus routing, size
-limits, base64-encoded bodies, field smuggling, and the 500 path.
+limits, base64-encoded bodies, field smuggling, the abuse limits below,
+and the 500 path.
+
+### Step 2: the adversarial review, and what it caught
+
+Before deploying, the new code went through a multi-agent review: three
+independent reviewers (correctness, security, AWS configuration), and
+every finding then handed to a skeptic agent instructed to *refute* it
+against the real files. Five findings survived; one was refuted. All five
+were fixed and are worth knowing about:
+
+1. **(Blocker) Unbounded read amplification.** `GET /sessions` accepted
+   any `from` date back to year 0100 and paginated the whole partition.
+   An attacker could cheaply write ~85 MB into one user's partition, then
+   make every GET bill ~10,000 DynamoDB read units — the request throttle
+   counts *requests*, not the reads hiding behind one. Fix: `from` must
+   be within 400 days, and the store never reads past 6,000 items.
+2. **(Important) Unbounded storage growth.** Any real date across ten
+   millennia was storable, invisibly to the UI. Fix: a POSTed `localDate`
+   must be within [today−7, today+2] (slack for timezones and reopened
+   tabs), and each user-day holds at most 30 sessions — more than 24
+   hours of studying. The cap check must not break idempotency: a retry
+   of an already-stored session still answers 200 even on a full day
+   (there's a test for exactly that). Residual risk, accepted and
+   documented: an anonymous API can't stop invented user IDs; the
+   throttle bounds the write rate, and phase 2's real accounts are the
+   actual fix.
+3. **(Important) The identity tests tested nothing.** A JavaScript trap:
+   a destructuring default (`userId = USER`) also replaces an
+   *explicitly passed* `undefined` — so the "missing header" test was
+   silently sending a valid header, and both identity tests passed for
+   the wrong reason (their bodies were empty, so *any* 400 satisfied
+   them). The review proved the whole suite stayed green with the header
+   check deleted. Fix: `null` as the "omit the header" sentinel, plus
+   valid bodies so only the header check can produce the asserted 400.
+   Lesson: a test that has never failed has never proven anything.
+4. **(Minor) `.length` counts UTF-16 code units, not bytes** — the "2 KB"
+   body guard admitted ~6 KB of CJK text. `Buffer.byteLength` measures
+   real bytes.
+5. **(Minor) The documented test command ran zero tests** — `node --test
+   backend/test/` treats the directory as a test file on Node 24 and
+   fails; only the glob form works. Would have broken Stage 4's CI on
+   its first run.
+
+The refuted finding claimed the range query needed an upper bound to
+exclude hypothetical future non-session items; the skeptic showed no such
+items can exist under the current writer and IAM, and that plausible
+future key layouts sort *before* the range anyway. Good instinct, not a
+defect — which is precisely why findings get cross-examined before
+anyone acts on them.

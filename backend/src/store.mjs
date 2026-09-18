@@ -15,7 +15,12 @@
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
-import { userPK, sessionSK, fromBoundSK, sessionFromItem } from './keys.mjs';
+import { userPK, sessionSK, fromBoundSK, dayPrefixSK, sessionFromItem } from './keys.mjs';
+
+// Hard ceiling on items one GET may read (~1.2 MB of sessions — triple a
+// physically-maxed 26-week grid). Together with the handler's 400-day
+// window this bounds the worst-case DynamoDB cost of any single request.
+const MAX_LIST_ITEMS = 6000;
 
 export class DynamoStore {
   constructor(tableName) {
@@ -50,10 +55,31 @@ export class DynamoStore {
   }
 
   /*
+    The sessionIds already stored for one user on one calendar day —
+    the handler's daily-cap check. Keys-only projection, one page: with
+    the cap at 30, fifty is more than we ever need to see.
+  */
+  async listDaySessionIds(userId, localDate) {
+    const page = await this.doc.send(new QueryCommand({
+      TableName: this.tableName,
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :day)',
+      ExpressionAttributeValues: {
+        ':pk': userPK(userId),
+        ':day': dayPrefixSK(localDate),
+      },
+      ProjectionExpression: 'sessionId', // fetch just this attribute
+      Limit: 50,
+    }));
+    return (page.Items ?? []).map(item => item.sessionId);
+  }
+
+  /*
     One user's sessions from a date onward: a Query with a key RANGE
     condition (see keys.mjs for why string order makes this correct).
     DynamoDB returns at most 1 MB per call, so we loop over pages —
-    LastEvaluatedKey is the "resume from here" bookmark.
+    LastEvaluatedKey is the "resume from here" bookmark — but never past
+    MAX_LIST_ITEMS: a partition someone managed to bloat must not turn
+    one GET into an unbounded, billed read of the whole thing.
   */
   async listSessions(userId, fromDate) {
     const items = [];
@@ -66,11 +92,18 @@ export class DynamoStore {
           ':pk': userPK(userId),
           ':from': fromBoundSK(fromDate),
         },
+        Limit: MAX_LIST_ITEMS - items.length, // never read past the ceiling
         ExclusiveStartKey: resumeFrom,
       }));
       items.push(...(page.Items ?? []));
       resumeFrom = page.LastEvaluatedKey;
-    } while (resumeFrom);
+    } while (resumeFrom && items.length < MAX_LIST_ITEMS);
+
+    if (resumeFrom) {
+      // Only reachable on a partition far beyond honest use; say so in
+      // the logs instead of silently pretending this was everything.
+      console.warn(`listSessions truncated at ${MAX_LIST_ITEMS} items for one caller`);
+    }
     return items.map(sessionFromItem);
   }
 }
