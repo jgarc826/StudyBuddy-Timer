@@ -191,3 +191,71 @@ Levels are hour-buckets: 0 none, 1 under an hour, 2/3 one/two hours,
 - **Date overflow normalization** — `new Date(2026, 8, 40)` quietly becomes
   Oct 10, like `mktime` normalizing a `struct tm`; `addDays` relies on it,
   which also makes the day-walk immune to daylight-saving-time hiccups.
+
+### How to verify Stage 1 yourself
+
+1. Double-click `site/index.html` (or serve the folder and open it) — the
+   timer shows 50:00, buttons in the right enabled/disabled states, no
+   errors in the console (F12 → Console).
+2. Reopen it as `index.html?fast=1` — the yellow test badge appears and
+   every "minute" lasts one second.
+3. Press **Start**, watch the countdown and progress bar; after 50 fast
+   "minutes" (≈50 s) the page flips to teal **Break** by itself, and the
+   history card updates: `0.8 hours studied · 1 session`, with today's
+   square turning green (hover it for the tooltip).
+4. Refresh mid-focus — the countdown continues where it truly is.
+5. Press Start again after the break ends, then **Reset** — the abandoned
+   block is *not* counted.
+6. To wipe test data: open the console (F12) and run `localStorage.clear()`,
+   then refresh.
+
+Note: `localStorage` belongs to an *origin* (scheme + host + port), so
+sessions recorded on `file://…` and on `http://localhost:8123` are two
+separate stores. Don't be surprised if the grid differs between the two —
+that's the browser's same-origin rule, and it's also why Stage 3 moves the
+data behind an API instead.
+
+### Five interview questions about Stage 1
+
+1. **"Why does the timer compute remaining time from an end timestamp
+   instead of decrementing a counter every second?"**
+   Browsers throttle timers in background tabs, so ticks arrive late; a
+   decrementing counter drifts behind reality. Storing *when the block
+   ends* and recomputing `endsAt − now` on every tick makes each tick
+   self-correcting — and it makes refresh-survival trivial, since the
+   timestamp is also valid after a reload.
+
+2. **"How do you prevent a session from being counted twice?"**
+   Each focus block gets a UUID *when it starts*; the id lives in the
+   persisted timer state. Saving is idempotent: a save with an id that
+   already exists is a no-op reported as `'duplicate'`. So refreshes,
+   retries, or two tabs finishing the same block store one session. Stage 3
+   keeps the exact same rule server-side with a DynamoDB conditional write.
+
+3. **"Why is the storage interface async when localStorage is synchronous?"**
+   The interface is designed for its Stage 3 replacement — network calls to
+   an API, which are inherently async. Freezing an async contract now means
+   swapping the implementation later changes one file and no call sites.
+
+4. **"Why compute the calendar date (`localDate`) in the browser?"**
+   Only the browser knows the user's timezone. `startedAt` is stored in
+   UTC for unambiguous ordering, but the grid answers "which day did I
+   study?" in the user's *local* calendar — at 9 pm in California the UTC
+   date is already tomorrow, so deriving the day server-side (or via
+   `toISOString`) would color the wrong square.
+
+5. **"Why does the break start automatically but the next focus block
+   doesn't?"**
+   Product honesty. The break belongs to the block you just finished, so it
+   runs itself (timed from the moment focus ended, even if the tab was
+   asleep). But auto-starting *focus* would record study time nobody spent
+   — an open tab overnight would fabricate hours. Completed-only counting
+   plus manual starts keep the stats trustworthy.
+
+### What Stage 2 adds
+
+Terraform in `infra/` for a private S3 bucket (the site files) behind
+CloudFront (the CDN that serves them over HTTPS), wired with Origin Access
+Control so the bucket itself stays sealed, plus a deploy script. The app's
+code won't change — Stage 2 is purely about hosting these same three files
+on the internet.
