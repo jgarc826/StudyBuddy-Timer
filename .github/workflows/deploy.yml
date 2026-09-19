@@ -47,8 +47,19 @@ jobs:
 
       - name: Apply infrastructure
         run: |
-          terraform -chdir=infra init -input=false
-          terraform -chdir=infra apply -input=false -auto-approve
+          set -o pipefail
+          terraform -chdir=infra init -input=false 2>&1 | tee /tmp/tf-init.log
+          terraform -chdir=infra apply -input=false -auto-approve 2>&1 | tee /tmp/tf-apply.log
 
       - name: Deploy the site
-        run: ./scripts/deploy.sh
+        run: ./scripts/deploy.sh 2>&1 | tee /tmp/site-deploy.log
+
+      # Debuggability without GitHub access: when anything above fails,
+      # park the logs in the PRIVATE state bucket (never served by
+      # CloudFront) so they can be read with plain AWS credentials.
+      - name: Upload logs on failure
+        if: failure()
+        run: |
+          for f in /tmp/tf-init.log /tmp/tf-apply.log /tmp/site-deploy.log; do
+            [ -f "$f" ] && aws s3 cp "$f" "s3://studybuddy-timer-tfstate-719857072816/ci-debug/$(basename $f)" || true
+          done
