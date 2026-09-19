@@ -708,32 +708,49 @@ change.
   invocations/errors, duration (average and p95), API request count, and
   4xx vs 5xx.
 
-### Postmortem: why the first two deploys failed
+### Postmortem: six runs to green — three stacked root causes
 
-The pipeline's first runs died at the AWS handshake: `Not authorized to
-perform sts:AssumeRoleWithWebIdentity`. First hypothesis — IAM's
-eventual consistency (the role was two minutes old) — was **wrong**: a
-retry an hour later failed identically.
+The pipeline's first five runs failed, and every failure hid the next
+one. The sequence, and the tool that cracked each:
 
-The actual tool for this job was **CloudTrail** (AWS's audit log, on by
-default): looking up the rejected `AssumeRoleWithWebIdentity` events
-showed the *exact* subject GitHub presented:
+1. **OIDC handshake refused** (`Not authorized to perform
+   sts:AssumeRoleWithWebIdentity`). First hypothesis — IAM eventual
+   consistency, since the role was two minutes old — was **wrong**: an
+   hour-later retry failed identically. **CloudTrail** (AWS's always-on
+   audit log) showed the exact subject GitHub presented:
+   `repo:jgarc826@117320647/StudyBuddy-Timer@1376436134:ref:refs/heads/main`
+   — GitHub embeds **stable numeric ids** in its sub claims
+   (`owner@id/repo@id`, a defense against name-reuse attacks), while the
+   trust policy expected the classic name-only form. Fix: pin the
+   numeric ids (bonus: they survive renames; names don't), keep name
+   patterns as fallback.
 
-```
-repo:jgarc826@117320647/StudyBuddy-Timer@1376436134:ref:refs/heads/main
-```
+2. **`terraform init` refused the provider.** After the auth fix,
+   CloudTrail showed a successful handshake and then *zero* AWS calls —
+   death inside init. The **IAM policy simulator** ruled out state-bucket
+   permissions. Cause: `.terraform.lock.hcl` held provider checksums for
+   **macOS/ARM only** (local init records only its own platform), so the
+   Ubuntu runner's Linux download matched nothing. Fix: `terraform
+   providers lock -platform=linux_amd64 -platform=darwin_arm64`.
 
-GitHub embeds **stable numeric ids** in its OIDC sub claims
-(`owner@id/repo@id`) — a defense against name-reuse attacks — while the
-trust policy expected the classic name-only form. No amount of waiting
-fixes a string mismatch. The fix pins the numeric ids (which, as a
-bonus, survive account and repo renames — names don't) and keeps the
-name-only patterns as fallback.
+3. **The repo was missing three Terraform files.** Still failing, and
+   CloudTrail had nothing left to say — so the workflow was taught to
+   **upload its own logs on failure** to the private state bucket,
+   readable with plain AWS credentials. The very next run confessed:
+   `Reference to undeclared resource` — `dynamodb.tf`, `lambda.tf`, and
+   `api.tf` had been written and applied locally in Stage 3 **but never
+   committed** (`git add backend/` doesn't pick up `infra/`). Local
+   applies kept working because the files existed locally; CI was the
+   first thing to check out the repo cold. "Works on my machine,"
+   infrastructure edition.
 
-Two lessons worth repeating in an interview: when an identity system
-says no, *go read what was actually presented* instead of re-reading
-what you configured; and the audit log, not the error message, is where
-that evidence lives.
+Lessons that generalize: when an identity system says no, *read what
+was actually presented* (the audit log, not the error message, holds
+that evidence); a green local run proves nothing about the repo —
+only a cold checkout does; and when a remote system's logs are out of
+reach, make it *ship its logs to you*. Also: each fix revealing the
+next failure is normal, not embarrassing — five reds and then a green
+is what a real bring-up looks like.
 
 ### Loose ends, stated honestly
 
