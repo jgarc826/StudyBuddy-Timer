@@ -16,5 +16,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.0" # any 6.x, but never a future 7.x — like a semver cap
     }
+    # Zips backend/src into the Lambda deployment package (lambda.tf).
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 }
