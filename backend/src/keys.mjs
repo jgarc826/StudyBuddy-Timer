@@ -34,6 +34,39 @@ export function dayPrefixSK(localDate) {
   return `SESSION#${localDate}#`;
 }
 
+/* ---- Phase 3: friends & presence ----------------------------------------
+   Three more item types under the same USER# partitions. Their prefixes
+   are chosen to sort BEFORE "SESSION#" (F < N < R < S), and the session
+   range query is bounded on both ends anyway — see SESSION_UPPER_BOUND_SK.
+
+     SK = "FRIEND#<userId>"   an accepted friendship. Stored MIRRORED —
+                              one item under each person — so "my friends"
+                              is a single cheap begins_with query.
+     SK = "REQUEST#<userId>"  a pending request, stored under the
+                              RECIPIENT (it's their inbox), keyed by the
+                              sender — so one item per sender+recipient
+                              pair, ever: request spam cannot grow data.
+     SK = "NOW"               presence: this user is mid-focus-block.
+                              Carries a TTL so it self-destructs.
+*/
+
+export function friendSK(friendUserId) {
+  return `FRIEND#${friendUserId}`;
+}
+
+export function requestSK(fromUserId) {
+  return `REQUEST#${fromUserId}`;
+}
+
+export const NOW_SK = 'NOW';
+
+// Upper bound for session range queries. '$' is the character after '#',
+// so every "SESSION#..." sorts below "SESSION$" and nothing else can ever
+// land inside the range. (A Stage-3 reviewer proposed this bound; it was
+// refuted as speculative back when sessions were the only item type.
+// Phase 3 added more types, and speculation became a requirement.)
+export const SESSION_UPPER_BOUND_SK = 'SESSION$';
+
 // A stored item carries PK/SK plus the payload fields; callers only get
 // the payload back, never our internal key layout.
 export function sessionFromItem(item) {

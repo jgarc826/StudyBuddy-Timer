@@ -23,4 +23,14 @@ resource "aws_dynamodb_table" "sessions" {
     name = "SK"
     type = "S"
   }
+
+  # TTL: items carrying an `expiresAt` (epoch seconds) are deleted by the
+  # table itself, for free. Only the phase-3 presence items use it — a
+  # closed laptop can't stay "studying now" forever. Deletion can lag,
+  # so readers still check the timestamp; TTL is the garbage collector,
+  # not the source of truth.
+  ttl {
+    attribute_name = "expiresAt"
+    enabled        = true
+  }
 }

@@ -15,7 +15,10 @@ resource "aws_apigatewayv2_api" "api" {
       "https://${aws_cloudfront_distribution.site.domain_name}", # the deployed site
       "http://localhost:8123",                                   # local development server
     ]
-    allow_methods = ["GET", "POST", "OPTIONS"]
+    # DELETE joined in phase 3 (clearing presence). Review lesson: a route
+    # can exist and pass every backend test while the browser refuses to
+    # call it — CORS is part of an endpoint's definition.
+    allow_methods = ["GET", "POST", "DELETE", "OPTIONS"]
     # Phase 2: the x-user-id header is gone; identity now travels as a
     # signed token in the standard Authorization header.
     allow_headers = ["content-type", "authorization"]
@@ -83,6 +86,28 @@ resource "aws_apigatewayv2_stage" "default" {
     throttling_rate_limit  = 5  # requests per second, steady state
     throttling_burst_limit = 10 # brief spikes allowed above the rate
   }
+}
+
+# Phase 3: the friends & presence routes, all JWT-protected. Terraform's
+# for_each stamps out one identical route resource per entry — the map key
+# is the route, the value is ignored.
+resource "aws_apigatewayv2_route" "friends" {
+  for_each = toset([
+    "GET /friends",
+    "GET /friends/sessions",
+    "POST /friends/requests",
+    "POST /friends/accept",
+    "POST /friends/decline",
+    "POST /friends/remove",
+    "POST /status",
+    "DELETE /status",
+  ])
+
+  api_id             = aws_apigatewayv2_api.api.id
+  route_key          = each.value
+  target             = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 # Lambda's own guard: only THIS API may invoke the function. (The role in

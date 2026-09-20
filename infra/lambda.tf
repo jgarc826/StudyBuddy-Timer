@@ -43,9 +43,23 @@ resource "aws_iam_role" "api_lambda" {
 # plus writing its own logs.
 data "aws_iam_policy_document" "lambda_permissions" {
   statement {
-    sid       = "SessionsTableAccess"
-    actions   = ["dynamodb:PutItem", "dynamodb:Query"]
+    sid = "SessionsTableAccess"
+    # Phase 3 added single-item reads/deletes and the batched presence
+    # lookup. Transactions (accept/unfriend) need no separate action —
+    # they're authorized by the permissions of their parts.
+    actions = [
+      "dynamodb:PutItem", "dynamodb:Query",
+      "dynamodb:GetItem", "dynamodb:DeleteItem", "dynamodb:BatchGetItem",
+    ]
     resources = [aws_dynamodb_table.sessions.arn]
+  }
+
+  # Exactly one Cognito power: the read-only email->account lookup behind
+  # friend requests. No Admin* anything.
+  statement {
+    sid       = "LookupUsersByEmail"
+    actions   = ["cognito-idp:ListUsers"]
+    resources = [aws_cognito_user_pool.users.arn]
   }
 
   statement {
@@ -84,7 +98,8 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      TABLE_NAME = aws_dynamodb_table.sessions.name
+      TABLE_NAME   = aws_dynamodb_table.sessions.name
+      USER_POOL_ID = aws_cognito_user_pool.users.id
     }
   }
 

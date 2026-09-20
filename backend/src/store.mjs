@@ -14,8 +14,14 @@
 */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
-import { userPK, sessionSK, fromBoundSK, dayPrefixSK, sessionFromItem } from './keys.mjs';
+import {
+  DynamoDBDocumentClient, PutCommand, GetCommand, DeleteCommand,
+  QueryCommand, BatchGetCommand, TransactWriteCommand,
+} from '@aws-sdk/lib-dynamodb';
+import {
+  userPK, sessionSK, fromBoundSK, dayPrefixSK, sessionFromItem,
+  friendSK, requestSK, NOW_SK, SESSION_UPPER_BOUND_SK,
+} from './keys.mjs';
 
 // Hard ceiling on items one GET may read (~1.2 MB of sessions — triple a
 // physically-maxed 26-week grid). Together with the handler's 400-day
@@ -87,10 +93,14 @@ export class DynamoStore {
     do {
       const page = await this.doc.send(new QueryCommand({
         TableName: this.tableName,
-        KeyConditionExpression: 'PK = :pk AND SK >= :from',
+        // Bounded on BOTH ends since phase 3: partitions now hold friend,
+        // request, and presence items too, and this range can never
+        // touch them (see SESSION_UPPER_BOUND_SK in keys.mjs).
+        KeyConditionExpression: 'PK = :pk AND SK BETWEEN :from AND :upper',
         ExpressionAttributeValues: {
           ':pk': userPK(userId),
           ':from': fromBoundSK(fromDate),
+          ':upper': SESSION_UPPER_BOUND_SK,
         },
         Limit: MAX_LIST_ITEMS - items.length, // never read past the ceiling
         ExclusiveStartKey: resumeFrom,
@@ -105,5 +115,175 @@ export class DynamoStore {
       console.warn(`listSessions truncated at ${MAX_LIST_ITEMS} items for one caller`);
     }
     return items.map(sessionFromItem);
+  }
+
+  /* ---- Phase 3: friendships, requests, presence ------------------------ */
+
+  // The friendship item under MY partition, or null. This one GetItem is
+  // the authorization check guarding every look at a friend's data.
+  async getFriendship(userId, otherUserId) {
+    const out = await this.doc.send(new GetCommand({
+      TableName: this.tableName,
+      Key: { PK: userPK(userId), SK: friendSK(otherUserId) },
+    }));
+    return out.Item ?? null;
+  }
+
+  // A pending request lives under its RECIPIENT, keyed by sender — one
+  // item per pair ever, so repeated requests overwrite, never accumulate.
+  async putRequest(toUserId, fromUserId, fromEmail, createdAt) {
+    await this.doc.send(new PutCommand({
+      TableName: this.tableName,
+      Item: {
+        PK: userPK(toUserId), SK: requestSK(fromUserId),
+        fromUserId, fromEmail, createdAt,
+      },
+    }));
+  }
+
+  async getRequest(toUserId, fromUserId) {
+    const out = await this.doc.send(new GetCommand({
+      TableName: this.tableName,
+      Key: { PK: userPK(toUserId), SK: requestSK(fromUserId) },
+    }));
+    return out.Item ?? null;
+  }
+
+  async deleteRequest(toUserId, fromUserId) {
+    await this.doc.send(new DeleteCommand({
+      TableName: this.tableName,
+      Key: { PK: userPK(toUserId), SK: requestSK(fromUserId) },
+    }));
+  }
+
+  /*
+    Accepting = one ATOMIC transaction: write the friendship under both
+    people and delete the request. All three happen or none do — no state
+    where A lists B as a friend but B doesn't list A. (A transaction is
+    the only new DynamoDB idea here; IAM-wise it just needs the same
+    put/delete permissions as its parts.)
+  */
+  async acceptRequest(meId, meEmail, fromUserId, fromEmail, since) {
+    await this.doc.send(new TransactWriteCommand({
+      TransactItems: [
+        { Put: { TableName: this.tableName, Item: {
+          PK: userPK(meId), SK: friendSK(fromUserId),
+          friendUserId: fromUserId, friendEmail: fromEmail, since,
+        } } },
+        { Put: { TableName: this.tableName, Item: {
+          PK: userPK(fromUserId), SK: friendSK(meId),
+          friendUserId: meId, friendEmail: meEmail, since,
+        } } },
+        { Delete: { TableName: this.tableName, Key: {
+          PK: userPK(meId), SK: requestSK(fromUserId),
+        } } },
+        // The REVERSE pending request too, if we'd both asked each other
+        // (deleting a nonexistent item is a no-op). Review-caught: a
+        // stale reverse request left behind here could later be
+        // "accepted" to silently re-create an unfriended friendship.
+        { Delete: { TableName: this.tableName, Key: {
+          PK: userPK(fromUserId), SK: requestSK(meId),
+        } } },
+      ],
+    }));
+  }
+
+  // Unfriending removes both mirrored friendship items AND any pending
+  // requests in either direction, atomically — revoking access must not
+  // leave behind a stale invitation that could quietly restore it.
+  async removeFriendship(userId, otherUserId) {
+    await this.doc.send(new TransactWriteCommand({
+      TransactItems: [
+        { Delete: { TableName: this.tableName, Key: {
+          PK: userPK(userId), SK: friendSK(otherUserId),
+        } } },
+        { Delete: { TableName: this.tableName, Key: {
+          PK: userPK(otherUserId), SK: friendSK(userId),
+        } } },
+        { Delete: { TableName: this.tableName, Key: {
+          PK: userPK(userId), SK: requestSK(otherUserId),
+        } } },
+        { Delete: { TableName: this.tableName, Key: {
+          PK: userPK(otherUserId), SK: requestSK(userId),
+        } } },
+      ],
+    }));
+  }
+
+  // Everything the Friends panel needs: two begins_with queries. A single
+  // page of 200 each — beyond that isn't a study group, it's a botnet.
+  async listFriendsAndRequests(userId) {
+    const query = prefix => this.doc.send(new QueryCommand({
+      TableName: this.tableName,
+      KeyConditionExpression: 'PK = :pk AND begins_with(SK, :p)',
+      ExpressionAttributeValues: { ':pk': userPK(userId), ':p': prefix },
+      Limit: 200,
+    }));
+    const [friendsOut, requestsOut] = await Promise.all([
+      query('FRIEND#'), query('REQUEST#'),
+    ]);
+    return {
+      friends: (friendsOut.Items ?? []).map(i => ({
+        userId: i.friendUserId, email: i.friendEmail, since: i.since,
+      })),
+      requests: (requestsOut.Items ?? []).map(i => ({
+        fromUserId: i.fromUserId, fromEmail: i.fromEmail,
+      })),
+    };
+  }
+
+  /*
+    Presence for a set of users in one round trip (BatchGetItem takes up
+    to 100 keys per call). Returns a Map of userId -> `until` timestamp
+    for users whose NOW item exists.
+  */
+  async getPresence(userIds) {
+    const found = new Map();
+    for (let i = 0; i < userIds.length; i += 100) {
+      let keys = userIds.slice(i, i + 100).map(id =>
+        ({ PK: userPK(id), SK: NOW_SK }));
+      // BatchGetItem may answer with only PART of a batch (UnprocessedKeys)
+      // under momentary pressure — ignoring that would quietly mislabel
+      // studying friends as idle. Retry the leftovers a few times.
+      let attempt = 0;
+      while (keys.length > 0 && attempt < 4) {
+        const out = await this.doc.send(new BatchGetCommand({
+          RequestItems: { [this.tableName]: { Keys: keys } },
+        }));
+        for (const item of out.Responses?.[this.tableName] ?? []) {
+          found.set(item.PK.slice('USER#'.length), item.until);
+        }
+        keys = out.UnprocessedKeys?.[this.tableName]?.Keys ?? [];
+        attempt += 1;
+        if (keys.length > 0) {
+          await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+        }
+      }
+      if (keys.length > 0) {
+        console.warn(`getPresence gave up on ${keys.length} unprocessed key(s)`);
+      }
+    }
+    return found;
+  }
+
+  // "I'm studying until <until>." expiresAt is DynamoDB's TTL attribute
+  // (epoch SECONDS): the table deletes the item itself after the block
+  // ends, so a closed laptop can never look studious forever.
+  async setPresence(userId, untilIso) {
+    await this.doc.send(new PutCommand({
+      TableName: this.tableName,
+      Item: {
+        PK: userPK(userId), SK: NOW_SK,
+        until: untilIso,
+        expiresAt: Math.floor(Date.parse(untilIso) / 1000),
+      },
+    }));
+  }
+
+  async clearPresence(userId) {
+    await this.doc.send(new DeleteCommand({
+      TableName: this.tableName,
+      Key: { PK: userPK(userId), SK: NOW_SK },
+    }));
   }
 }

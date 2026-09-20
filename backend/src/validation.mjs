@@ -45,3 +45,16 @@ export function isIsoTimestamp(value) {
 export function isMinutes(value) {
   return Number.isInteger(value) && value >= 1 && value <= 180;
 }
+
+// A plausible email for the friend-request lookup. Deliberately loose —
+// Cognito is the real authority on which emails exist — EXCEPT for quote
+// and backslash, which are the escape characters of Cognito's ListUsers
+// filter grammar: letting them through turns "validate then interpolate"
+// into an injection point (review-caught). No real email this app serves
+// contains either.
+export function isEmail(value) {
+  return typeof value === 'string'
+    && value.length <= 320
+    && !/["\\]/.test(value)
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}

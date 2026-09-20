@@ -16,5 +16,9 @@
 
 import { makeHandler } from './handler.mjs';
 import { DynamoStore } from './store.mjs';
+import { CognitoDirectory } from './users.mjs';
 
-export const handler = makeHandler(new DynamoStore(process.env.TABLE_NAME));
+export const handler = makeHandler(
+  new DynamoStore(process.env.TABLE_NAME),
+  new CognitoDirectory(process.env.USER_POOL_ID),
+);

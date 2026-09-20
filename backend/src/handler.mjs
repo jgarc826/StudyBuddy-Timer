@@ -16,7 +16,7 @@
   lowercased names, query parameters, body).
 */
 
-import { isUuid, isLocalDate, isIsoTimestamp, isMinutes } from './validation.mjs';
+import { isUuid, isLocalDate, isIsoTimestamp, isMinutes, isEmail } from './validation.mjs';
 
 // Real requests are ~200 bytes; anything bigger is not our client.
 const MAX_BODY_BYTES = 2048;
@@ -42,8 +42,11 @@ const POST_FUTURE_DAYS = 2;
 // GETs may look back far enough for any grid (26 weeks = 182 days) with
 // room to grow, but not back to year 0100.
 const GET_MAX_AGE_DAYS = 400;
+// "Studying now" may point at most this far into the future — a focus
+// block is 50 minutes; nobody honestly announces a 5-hour one.
+const PRESENCE_MAX_MS = 4 * 60 * 60 * 1000;
 
-export function makeHandler(store, now = Date.now) {
+export function makeHandler(store, directory, now = Date.now) {
   return async function handle(event) {
     try {
       const method = event.requestContext?.http?.method;
@@ -65,13 +68,23 @@ export function makeHandler(store, now = Date.now) {
         return reply(401, { message: 'Not authenticated' });
       }
 
-      if (method === 'POST' && path === '/sessions') {
-        return await postSession(store, userId, event, now);
+      // The signed-in account's own (verified) email, from the same token.
+      const userEmail = event.requestContext?.authorizer?.jwt?.claims?.email;
+
+      const route = `${method} ${path}`;
+      switch (route) {
+        case 'POST /sessions':         return await postSession(store, userId, event, now);
+        case 'GET /sessions':          return await getSessions(store, userId, event, now);
+        case 'POST /friends/requests': return await sendFriendRequest(store, directory, userId, userEmail, event, now);
+        case 'GET /friends':           return await getFriends(store, userId, now);
+        case 'POST /friends/accept':   return await acceptFriend(store, userId, userEmail, event, now);
+        case 'POST /friends/decline':  return await declineFriend(store, userId, event);
+        case 'POST /friends/remove':   return await removeFriend(store, userId, event);
+        case 'GET /friends/sessions':  return await getFriendSessions(store, userId, event, now);
+        case 'POST /status':           return await setStatus(store, userId, event, now);
+        case 'DELETE /status':         return await clearStatus(store, userId);
+        default:                       return reply(404, { message: 'Not found' });
       }
-      if (method === 'GET' && path === '/sessions') {
-        return await getSessions(store, userId, event, now);
-      }
-      return reply(404, { message: 'Not found' });
     } catch (err) {
       // Anything unexpected: log the details for CloudWatch, tell the
       // caller only that something failed (no internals in responses).
@@ -193,6 +206,163 @@ async function getSessions(store, userId, event, now) {
   account. The data it would have rescued: a single test session. When a
   feature's blast radius outweighs its payload, delete the feature.
 */
+
+/* ===== Phase 3: friends & presence ===================================== */
+
+/*
+  POST /friends/requests — body { email }. ALWAYS answers the same 200,
+  whether that email has an account or not: a friend request must not
+  double as an oracle for "who has an account here". The request item is
+  only actually written when the target exists, isn't yourself, and isn't
+  already your friend.
+*/
+async function sendFriendRequest(store, directory, userId, userEmail, event, now) {
+  const { body, error } = readJsonBody(event);
+  if (error) return error;
+  // Normalize BEFORE validating: humans type " Pal@X.com " and mean it.
+  const email = typeof body.email === 'string'
+    ? body.email.trim().toLowerCase() : body.email;
+  if (!isEmail(email)) {
+    return reply(400, { message: 'email must be a plausible email address' });
+  }
+
+  const sent = reply(200, { message: 'If that account exists, they have your request.' });
+
+  const target = await directory.findByEmail(email);
+  if (!target || target.userId === userId) return sent;
+  if (await store.getFriendship(userId, target.userId)) return sent;
+
+  await store.putRequest(target.userId, userId, userEmail, new Date(now()).toISOString());
+  return sent;
+}
+
+// GET /friends — the whole Friends panel in one call: accepted friends
+// (with a live "studying" flag) and pending requests awaiting my answer.
+async function getFriends(store, userId, now) {
+  const { friends, requests } = await store.listFriendsAndRequests(userId);
+
+  const presence = friends.length
+    ? await store.getPresence(friends.map(f => f.userId))
+    : new Map();
+  const nowMs = now();
+  const withPresence = friends.map(f => {
+    const until = presence.get(f.userId);
+    // TTL deletion can lag; trust the timestamp, not the item's existence.
+    const studying = Boolean(until) && Date.parse(until) > nowMs;
+    return { ...f, studying };
+  });
+
+  return reply(200, { friends: withPresence, requests });
+}
+
+// POST /friends/accept — body { fromUserId }. Only a request that is
+// actually sitting in MY inbox can be accepted; accepting is atomic
+// (both mirrored friendship items + request cleanup, or nothing).
+async function acceptFriend(store, userId, userEmail, event, now) {
+  const { body, error } = readJsonBody(event);
+  if (error) return error;
+  if (!isUuid(body.fromUserId)) {
+    return reply(400, { message: 'fromUserId must be a UUID' });
+  }
+
+  if (body.fromUserId === userId) {
+    return reply(400, { message: 'That is you' });
+  }
+
+  const request = await store.getRequest(userId, body.fromUserId);
+  if (!request) {
+    return reply(404, { message: 'No such pending request' });
+  }
+
+  await store.acceptRequest(userId, userEmail, body.fromUserId,
+    request.fromEmail, new Date(now()).toISOString());
+  return reply(200, { friendUserId: body.fromUserId, friendEmail: request.fromEmail });
+}
+
+// POST /friends/decline — body { fromUserId }. Deleting a request that
+// isn't there is a harmless no-op, so no existence check needed.
+async function declineFriend(store, userId, event) {
+  const { body, error } = readJsonBody(event);
+  if (error) return error;
+  if (!isUuid(body.fromUserId)) {
+    return reply(400, { message: 'fromUserId must be a UUID' });
+  }
+  await store.deleteRequest(userId, body.fromUserId);
+  return reply(200, { declined: body.fromUserId });
+}
+
+// POST /friends/remove — body { userId }: unfriend, both directions.
+async function removeFriend(store, userId, event) {
+  const { body, error } = readJsonBody(event);
+  if (error) return error;
+  if (!isUuid(body.userId)) {
+    return reply(400, { message: 'userId must be a UUID' });
+  }
+  // Self-unfriending would put two operations on ONE item into the
+  // transaction, which DynamoDB rejects — refuse it here instead of
+  // manufacturing 500s (review-caught).
+  if (body.userId === userId) {
+    return reply(400, { message: 'That is you' });
+  }
+  await store.removeFriendship(userId, body.userId);
+  return reply(200, { removed: body.userId });
+}
+
+/*
+  GET /friends/sessions?userId=X&from=YYYY-MM-DD — a friend's history
+  plus their live status. THE authorization check of phase 3: the
+  friendship item under MY OWN partition must exist. Not being friends
+  gets a 403 regardless of whether X exists — no probing.
+*/
+async function getFriendSessions(store, userId, event, now) {
+  const otherId = event.queryStringParameters?.userId;
+  const from = event.queryStringParameters?.from;
+  if (!isUuid(otherId)) {
+    return reply(400, { message: "Query parameter 'userId' must be a UUID" });
+  }
+  if (!isLocalDate(from)) {
+    return reply(400, { message: "Query parameter 'from' must be a real YYYY-MM-DD date" });
+  }
+  if (from < dateStringPlusDays(now(), -GET_MAX_AGE_DAYS)) {
+    return reply(400, { message: `'from' must be within the last ${GET_MAX_AGE_DAYS} days` });
+  }
+
+  const friendship = await store.getFriendship(userId, otherId);
+  if (!friendship) {
+    return reply(403, { message: 'You can only view a friend\'s history' });
+  }
+
+  const sessions = await store.listSessions(otherId, from);
+  const presence = await store.getPresence([otherId]);
+  const until = presence.get(otherId);
+  const studyingUntil = until && Date.parse(until) > now() ? until : null;
+
+  return reply(200, { email: friendship.friendEmail, sessions, studyingUntil });
+}
+
+// POST /status — body { until }: "I'm mid-focus-block until <until>".
+// Bounded to the near future; the stored item also self-destructs via
+// TTL, so presence can never outlive the block that set it.
+async function setStatus(store, userId, event, now) {
+  const { body, error } = readJsonBody(event);
+  if (error) return error;
+  if (!isIsoTimestamp(body.until)) {
+    return reply(400, { message: 'until must be an ISO 8601 timestamp' });
+  }
+  const untilMs = Date.parse(body.until);
+  const nowMs = now();
+  if (untilMs <= nowMs || untilMs > nowMs + PRESENCE_MAX_MS) {
+    return reply(400, { message: 'until must be in the near future' });
+  }
+  await store.setPresence(userId, body.until);
+  return reply(200, { studyingUntil: body.until });
+}
+
+// DELETE /status — the block ended, paused, or was reset.
+async function clearStatus(store, userId) {
+  await store.clearPresence(userId);
+  return reply(200, { studyingUntil: null });
+}
 
 // One place builds every response, so the shape is always the same.
 function reply(statusCode, bodyObject) {

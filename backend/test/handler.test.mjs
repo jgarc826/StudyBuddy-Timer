@@ -53,12 +53,71 @@ function fakeStore(overrides = {}) {
       calls.dayIds.push({ userId, localDate });
       return overrides.dayIdsReturns ?? [];
     },
+    // Phase 3 surface, happy-path defaults, all recorded.
+    async getFriendship(userId, otherUserId) {
+      calls.getFriendship = calls.getFriendship ?? [];
+      calls.getFriendship.push({ userId, otherUserId });
+      return overrides.friendshipReturns ?? null;
+    },
+    async putRequest(toUserId, fromUserId, fromEmail, createdAt) {
+      calls.putRequest = calls.putRequest ?? [];
+      calls.putRequest.push({ toUserId, fromUserId, fromEmail, createdAt });
+    },
+    async getRequest(toUserId, fromUserId) {
+      calls.getRequest = calls.getRequest ?? [];
+      calls.getRequest.push({ toUserId, fromUserId });
+      return overrides.requestReturns ?? null;
+    },
+    async deleteRequest(toUserId, fromUserId) {
+      calls.deleteRequest = calls.deleteRequest ?? [];
+      calls.deleteRequest.push({ toUserId, fromUserId });
+    },
+    async acceptRequest(meId, meEmail, fromUserId, fromEmail, since) {
+      calls.accept = calls.accept ?? [];
+      calls.accept.push({ meId, meEmail, fromUserId, fromEmail, since });
+    },
+    async removeFriendship(userId, otherUserId) {
+      calls.removeFriendship = calls.removeFriendship ?? [];
+      calls.removeFriendship.push({ userId, otherUserId });
+    },
+    async listFriendsAndRequests(userId) {
+      calls.listFriends = calls.listFriends ?? [];
+      calls.listFriends.push(userId);
+      return overrides.friendsListReturns ?? { friends: [], requests: [] };
+    },
+    async getPresence(userIds) {
+      calls.getPresence = calls.getPresence ?? [];
+      calls.getPresence.push(userIds);
+      return overrides.presenceReturns ?? new Map();
+    },
+    async setPresence(userId, untilIso) {
+      calls.setPresence = calls.setPresence ?? [];
+      calls.setPresence.push({ userId, untilIso });
+    },
+    async clearPresence(userId) {
+      calls.clearPresence = calls.clearPresence ?? [];
+      calls.clearPresence.push(userId);
+    },
     ...overrides.methods,
   };
 }
 
-function handlerWith(store) {
-  return makeHandler(store, NOW);
+const MY_EMAIL = 'me@test.invalid';
+
+// The user directory (Cognito lookup), faked the same way as the store.
+function fakeDirectory(overrides = {}) {
+  const calls = { find: [] };
+  return {
+    calls,
+    async findByEmail(email) {
+      calls.find.push(email);
+      return overrides.findReturns ?? null;
+    },
+  };
+}
+
+function handlerWith(store, directory = fakeDirectory()) {
+  return makeHandler(store, directory, NOW);
 }
 
 /*
@@ -75,7 +134,7 @@ function mkEvent({ method = 'POST', path = '/sessions', userId = USER,
     rawPath: path,
     requestContext: {
       http: { method },
-      ...(userId === null ? {} : { authorizer: { jwt: { claims: { sub: userId } } } }),
+      ...(userId === null ? {} : { authorizer: { jwt: { claims: { sub: userId, email: MY_EMAIL } } } }),
     },
     headers: {},
     queryStringParameters: query,
@@ -315,6 +374,227 @@ test("rejects GET with a 'from' older than the allowed window", async () => {
 });
 
 /* ---- routing and failure behavior --------------------------------------- */
+
+/* ---- Phase 3: friend requests -------------------------------------------- */
+
+const FRIEND = 'cccccccc-dddd-4eee-8fff-000000000001';
+
+test('request to an existing account: 200, request stored under the recipient', async () => {
+  const store = fakeStore();
+  const directory = fakeDirectory({ findReturns: { userId: FRIEND, email: 'pal@test.invalid' } });
+  const handle = handlerWith(store, directory);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/requests', body: { email: 'Pal@Test.Invalid ' } })));
+
+  assert.equal(status, 200);
+  assert.deepEqual(directory.calls.find, ['pal@test.invalid']); // trimmed + lowercased
+  assert.equal(store.calls.putRequest.length, 1);
+  const put = store.calls.putRequest[0];
+  assert.equal(put.toUserId, FRIEND);   // lives in the RECIPIENT's inbox
+  assert.equal(put.fromUserId, USER);
+  assert.equal(put.fromEmail, MY_EMAIL);
+});
+
+test('request to an unknown email: SAME 200, nothing stored (no oracle)', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store, fakeDirectory({ findReturns: null }));
+  const { status, body } = parse(await handle(
+    mkEvent({ path: '/friends/requests', body: { email: 'nobody@test.invalid' } })));
+
+  assert.equal(status, 200);
+  assert.match(body.message, /if that account exists/i);
+  assert.equal(store.calls.putRequest, undefined);
+});
+
+test('request to yourself: 200, nothing stored', async () => {
+  const store = fakeStore();
+  const directory = fakeDirectory({ findReturns: { userId: USER, email: MY_EMAIL } });
+  const handle = handlerWith(store, directory);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/requests', body: { email: MY_EMAIL } })));
+  assert.equal(status, 200);
+  assert.equal(store.calls.putRequest, undefined);
+});
+
+test('request to an existing friend: 200, nothing stored', async () => {
+  const store = fakeStore({ friendshipReturns: { friendUserId: FRIEND } });
+  const directory = fakeDirectory({ findReturns: { userId: FRIEND, email: 'pal@test.invalid' } });
+  const handle = handlerWith(store, directory);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/requests', body: { email: 'pal@test.invalid' } })));
+  assert.equal(status, 200);
+  assert.equal(store.calls.putRequest, undefined);
+});
+
+test('request with a garbage email: 400 before any lookup', async () => {
+  const directory = fakeDirectory();
+  const handle = handlerWith(fakeStore(), directory);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/requests', body: { email: 'not an email' } })));
+  assert.equal(status, 400);
+  assert.equal(directory.calls.find.length, 0);
+});
+
+/* ---- Phase 3: accept / decline / remove ---------------------------------- */
+
+test('accepting a real pending request: atomic accept with the right names', async () => {
+  const store = fakeStore({ requestReturns: { fromUserId: FRIEND, fromEmail: 'pal@test.invalid' } });
+  const handle = handlerWith(store);
+  const { status, body } = parse(await handle(
+    mkEvent({ path: '/friends/accept', body: { fromUserId: FRIEND } })));
+
+  assert.equal(status, 200);
+  assert.equal(body.friendEmail, 'pal@test.invalid');
+  assert.deepEqual(store.calls.accept[0], {
+    meId: USER, meEmail: MY_EMAIL,
+    fromUserId: FRIEND, fromEmail: 'pal@test.invalid',
+    since: new Date(NOW()).toISOString(),
+  });
+});
+
+test('accepting a request that does not exist: 404, nothing written', async () => {
+  const store = fakeStore({ requestReturns: null });
+  const handle = handlerWith(store);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/accept', body: { fromUserId: FRIEND } })));
+  assert.equal(status, 404);
+  assert.equal(store.calls.accept, undefined);
+});
+
+test('declining deletes the request from my inbox', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/decline', body: { fromUserId: FRIEND } })));
+  assert.equal(status, 200);
+  assert.deepEqual(store.calls.deleteRequest[0], { toUserId: USER, fromUserId: FRIEND });
+});
+
+test('accepting "a request from yourself": 400, nothing written', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/accept', body: { fromUserId: USER } })));
+  assert.equal(status, 400);
+  assert.equal(store.calls.accept, undefined);
+});
+
+test('unfriending yourself: 400, no doomed transaction attempted', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/remove', body: { userId: USER } })));
+  assert.equal(status, 400);
+  assert.equal(store.calls.removeFriendship, undefined);
+});
+
+test('emails carrying filter metacharacters: 400 before any lookup', async () => {
+  const directory = fakeDirectory();
+  const handle = handlerWith(fakeStore(), directory);
+  for (const email of ['a"b@test.invalid', 'a\\b@test.invalid']) {
+    const { status } = parse(await handle(
+      mkEvent({ path: '/friends/requests', body: { email } })));
+    assert.equal(status, 400, email);
+  }
+  assert.equal(directory.calls.find.length, 0);
+});
+
+test('unfriending removes the mirrored pair', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  const { status } = parse(await handle(
+    mkEvent({ path: '/friends/remove', body: { userId: FRIEND } })));
+  assert.equal(status, 200);
+  assert.deepEqual(store.calls.removeFriendship[0], { userId: USER, otherUserId: FRIEND });
+});
+
+/* ---- Phase 3: the friends panel and presence ------------------------------ */
+
+test('GET /friends merges live presence into the friend list', async () => {
+  const store = fakeStore({
+    friendsListReturns: {
+      friends: [
+        { userId: FRIEND, email: 'pal@test.invalid', since: 'x' },
+        { userId: 'dddddddd-eeee-4fff-8000-000000000002', email: 'idle@test.invalid', since: 'y' },
+      ],
+      requests: [{ fromUserId: 'eeeeeeee-ffff-4000-8111-000000000003', fromEmail: 'new@test.invalid' }],
+    },
+    // One friend studying until later today; the other's presence expired
+    // (TTL deletion lags — the timestamp, not the item, is the truth).
+    presenceReturns: new Map([
+      [FRIEND, '2026-09-18T12:40:00.000Z'],
+      ['dddddddd-eeee-4fff-8000-000000000002', '2026-09-18T09:00:00.000Z'],
+    ]),
+  });
+  const handle = handlerWith(store);
+  const { status, body } = parse(await handle(mkEvent({ method: 'GET', path: '/friends' })));
+
+  assert.equal(status, 200);
+  assert.equal(body.friends[0].studying, true);
+  assert.equal(body.friends[1].studying, false);
+  assert.equal(body.requests.length, 1);
+});
+
+test("a friend's sessions: friendship verified, presence included", async () => {
+  const store = fakeStore({
+    friendshipReturns: { friendUserId: FRIEND, friendEmail: 'pal@test.invalid' },
+    listReturns: [GOOD_SESSION],
+    presenceReturns: new Map([[FRIEND, '2026-09-18T12:40:00.000Z']]),
+  });
+  const handle = handlerWith(store);
+  const { status, body } = parse(await handle(mkEvent({
+    method: 'GET', path: '/friends/sessions',
+    query: { userId: FRIEND, from: '2026-03-01' },
+  })));
+
+  assert.equal(status, 200);
+  assert.equal(body.email, 'pal@test.invalid');
+  assert.deepEqual(body.sessions, [GOOD_SESSION]);
+  assert.equal(body.studyingUntil, '2026-09-18T12:40:00.000Z');
+  assert.deepEqual(store.calls.list[0], { userId: FRIEND, fromDate: '2026-03-01' });
+});
+
+test("a NON-friend's sessions: 403, and the data is never even queried", async () => {
+  const store = fakeStore({ friendshipReturns: null });
+  const handle = handlerWith(store);
+  const { status } = parse(await handle(mkEvent({
+    method: 'GET', path: '/friends/sessions',
+    query: { userId: FRIEND, from: '2026-03-01' },
+  })));
+
+  assert.equal(status, 403);
+  assert.equal(store.calls.list.length, 0);
+});
+
+test('setting presence stores the block-end time', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  const until = '2026-09-18T12:50:00.000Z'; // 50 minutes after NOW
+  const { status } = parse(await handle(
+    mkEvent({ path: '/status', body: { until } })));
+  assert.equal(status, 200);
+  assert.deepEqual(store.calls.setPresence[0], { userId: USER, untilIso: until });
+});
+
+test('presence in the past or absurdly far ahead: 400', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  for (const until of ['2026-09-18T11:00:00.000Z',    // before NOW
+                       '2026-09-18T19:00:00.000Z']) { // 7 hours ahead
+    const { status } = parse(await handle(
+      mkEvent({ path: '/status', body: { until } })));
+    assert.equal(status, 400, until);
+  }
+  assert.equal(store.calls.setPresence, undefined);
+});
+
+test('clearing presence deletes the NOW item', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  const { status } = parse(await handle(mkEvent({ method: 'DELETE', path: '/status' })));
+  assert.equal(status, 200);
+  assert.deepEqual(store.calls.clearPresence, [USER]);
+});
 
 test('the removed /migrate endpoint answers 404 like any unknown path', async () => {
   // The migration endpoint was cut after security review (see

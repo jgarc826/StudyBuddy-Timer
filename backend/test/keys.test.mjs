@@ -7,7 +7,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { userPK, sessionSK, fromBoundSK, dayPrefixSK, sessionFromItem } from '../src/keys.mjs';
+import {
+  userPK, sessionSK, fromBoundSK, dayPrefixSK, sessionFromItem,
+  friendSK, requestSK, NOW_SK, SESSION_UPPER_BOUND_SK,
+} from '../src/keys.mjs';
 
 const ID = '11111111-2222-4333-8444-555555555555';
 
@@ -46,6 +49,24 @@ test('string order equals date order across month and year boundaries', () => {
   assert.ok(sessionSK('2026-10-01', ID) >= fromBoundSK('2026-09-30'));
   assert.ok(sessionSK('2027-01-01', ID) >= fromBoundSK('2026-12-31'));
   assert.ok(sessionSK('2026-09-30', ID) < fromBoundSK('2026-10-01'));
+});
+
+test('phase-3 keys have the documented shapes', () => {
+  assert.equal(friendSK('u2'), 'FRIEND#u2');
+  assert.equal(requestSK('u3'), 'REQUEST#u3');
+  assert.equal(NOW_SK, 'NOW');
+});
+
+test('every non-session item sorts OUTSIDE the session range', () => {
+  // The sessions query reads BETWEEN "SESSION#<date>" AND "SESSION$".
+  // Friend, request, and presence items must all sort below that range,
+  // and the upper bound must sit above every possible session key.
+  const lower = fromBoundSK('0000-01-01'); // lowest bound any query could use
+  assert.ok(friendSK(ID) < lower);
+  assert.ok(requestSK(ID) < lower);
+  assert.ok(NOW_SK < lower);
+  assert.ok(sessionSK('9999-12-31', ID) < SESSION_UPPER_BOUND_SK);
+  assert.ok(SESSION_UPPER_BOUND_SK < 'SESSIONA'); // and the bound stays tight
 });
 
 test('sessionFromItem returns payload fields only, never PK/SK', () => {
