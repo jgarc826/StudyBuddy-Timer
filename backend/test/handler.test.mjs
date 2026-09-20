@@ -62,18 +62,22 @@ function handlerWith(store) {
 }
 
 /*
-  Build an API Gateway "payload 2.0" event with sensible defaults.
+  Build an API Gateway "payload 2.0" event with sensible defaults. In
+  phase 2 identity arrives as the verified JWT's claims, which the
+  gateway attaches under requestContext.authorizer — that's what we fake.
   CAREFUL LESSON (a reviewer caught this): a destructuring default like
-  `userId = USER` also replaces an EXPLICITLY passed undefined, so
-  "userId: undefined" would silently become a valid header. The sentinel
-  for "send no header" is therefore null, which defaults leave alone.
+  `userId = USER` also replaces an EXPLICITLY passed undefined, so the
+  sentinel for "no verified identity" is null, which defaults leave alone.
 */
 function mkEvent({ method = 'POST', path = '/sessions', userId = USER,
                    body, query } = {}) {
   return {
     rawPath: path,
-    requestContext: { http: { method } },
-    headers: userId === null ? {} : { 'x-user-id': userId },
+    requestContext: {
+      http: { method },
+      ...(userId === null ? {} : { authorizer: { jwt: { claims: { sub: userId } } } }),
+    },
+    headers: {},
     queryStringParameters: query,
     body: body === undefined ? undefined : JSON.stringify(body),
     isBase64Encoded: false,
@@ -85,27 +89,28 @@ function parse(res) {
 }
 
 /* ---- identity ---------------------------------------------------------- */
-// Both tests carry a fully VALID body, so the only thing that can cause
-// a 400 is the header check itself — remove that check from handler.mjs
-// and these tests fail, which is the whole point of having them.
+// The gateway's JWT authorizer normally guarantees a verified identity;
+// these tests cover the defensive check for a misconfigured route. Both
+// carry a fully VALID body, so only the identity check can cause the
+// asserted status — delete that check from handler.mjs and these fail.
 
-test('rejects a missing X-User-Id header with 400 and stores nothing', async () => {
+test('rejects a request with no verified identity: 401, stores nothing', async () => {
   const store = fakeStore();
   const handle = handlerWith(store);
   const { status, body } = parse(
     await handle(mkEvent({ userId: null, body: GOOD_SESSION })));
-  assert.equal(status, 400);
-  assert.match(body.message, /X-User-Id/);
+  assert.equal(status, 401);
+  assert.match(body.message, /authenticated/i);
   assert.equal(store.calls.put.length, 0);
 });
 
-test('rejects a non-UUID X-User-Id with 400 and stores nothing', async () => {
+test('rejects a non-UUID sub claim: 401, stores nothing', async () => {
   const store = fakeStore();
   const handle = handlerWith(store);
   const { status, body } = parse(
     await handle(mkEvent({ userId: 'alice', body: GOOD_SESSION })));
-  assert.equal(status, 400);
-  assert.match(body.message, /X-User-Id/);
+  assert.equal(status, 401);
+  assert.match(body.message, /authenticated/i);
   assert.equal(store.calls.put.length, 0);
 });
 
@@ -172,18 +177,27 @@ test('rejects a body that is not JSON with 400', async () => {
   assert.equal(parse(await handle(event)).status, 400);
 });
 
-test('rejects an oversized body with 400', async () => {
-  const handle = handlerWith(fakeStore());
-  const event = { ...mkEvent({}), body: 'x'.repeat(3000) };
+// Both size tests use VALID JSON (the review caught earlier versions
+// using garbage strings, which passed via the JSON-parse 400 and proved
+// nothing about the size guard itself).
+
+test('rejects an oversized body with 400 before storing anything', async () => {
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  const event = { ...mkEvent({}), body: JSON.stringify({ sessionId: 'x'.repeat(3000) }) };
   assert.equal(parse(await handle(event)).status, 400);
+  assert.equal(store.calls.put.length, 0);
 });
 
 test('measures the body limit in bytes, not string length', async () => {
-  const handle = handlerWith(fakeStore());
-  // 1,100 three-byte characters: length 1,100 but ~3,300 bytes — must be
-  // rejected now that the guard counts real bytes.
-  const event = { ...mkEvent({}), body: '見'.repeat(1100) };
+  const store = fakeStore();
+  const handle = handlerWith(store);
+  // Valid JSON whose UTF-16 length (~920) is under the 2048 cap but whose
+  // UTF-8 size (~2,700 bytes) is over it: a .length guard would wrongly
+  // accept this; the byte-counting guard must refuse it.
+  const event = { ...mkEvent({}), body: JSON.stringify({ sessionId: '見'.repeat(900) }) };
   assert.equal(parse(await handle(event)).status, 400);
+  assert.equal(store.calls.put.length, 0);
 });
 
 test('decodes a base64-encoded body before parsing', async () => {
@@ -200,11 +214,18 @@ test('decodes a base64-encoded body before parsing', async () => {
 
 /* ---- POST /sessions: abuse limits (from the security review) ------------ */
 
-test('rejects a localDate weeks in the past', async () => {
+test('accepts a localDate from weeks ago (signed-out study is delivered late)', async () => {
+  const handle = handlerWith(fakeStore());
+  const { status } = parse(await handle(
+    mkEvent({ body: { ...GOOD_SESSION, localDate: '2026-08-01' } })));
+  assert.equal(status, 201);
+});
+
+test('rejects a localDate beyond the 400-day window', async () => {
   const store = fakeStore();
   const handle = handlerWith(store);
   const { status } = parse(await handle(
-    mkEvent({ body: { ...GOOD_SESSION, localDate: '2026-08-01' } })));
+    mkEvent({ body: { ...GOOD_SESSION, localDate: '2025-01-01' } })));
   assert.equal(status, 400);
   assert.equal(store.calls.put.length, 0);
 });
@@ -294,6 +315,15 @@ test("rejects GET with a 'from' older than the allowed window", async () => {
 });
 
 /* ---- routing and failure behavior --------------------------------------- */
+
+test('the removed /migrate endpoint answers 404 like any unknown path', async () => {
+  // The migration endpoint was cut after security review (see
+  // handler.mjs); this pins that it stays gone.
+  const handle = handlerWith(fakeStore());
+  const { status } = parse(await handle(
+    mkEvent({ path: '/migrate', body: { fromUserId: USER } })));
+  assert.equal(status, 404);
+});
 
 test('answers 404 for unknown paths', async () => {
   const handle = handlerWith(fakeStore());

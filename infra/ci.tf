@@ -150,6 +150,37 @@ data "aws_iam_policy_document" "github_actions_permissions" {
     resources = ["arn:aws:logs:us-east-1:${local.account_id}:log-group:*"]
   }
 
+  # Cognito, deliberately NARROW (the security review caught cognito-idp:*
+  # here handing any pipeline compromise AdminSetUserPassword — i.e. every
+  # user's account). CI only manages the pool's configuration; it gets no
+  # Admin* powers over the people inside it.
+  statement {
+    sid = "CognitoManagePool"
+    actions = [
+      "cognito-idp:DescribeUserPool",
+      "cognito-idp:UpdateUserPool",
+      "cognito-idp:DeleteUserPool",
+      "cognito-idp:GetUserPoolMfaConfig",
+      "cognito-idp:SetUserPoolMfaConfig",
+      "cognito-idp:CreateUserPoolClient",
+      "cognito-idp:DescribeUserPoolClient",
+      "cognito-idp:UpdateUserPoolClient",
+      "cognito-idp:DeleteUserPoolClient",
+      "cognito-idp:TagResource",
+      "cognito-idp:UntagResource",
+      "cognito-idp:ListTagsForResource",
+    ]
+    resources = ["arn:aws:cognito-idp:us-east-1:${local.account_id}:userpool/*"]
+  }
+
+  # CreateUserPool supports no resource-level scoping at all (there is no
+  # ARN before the pool exists) — documented wildcard #3, single action.
+  statement {
+    sid       = "CognitoCreatePool"
+    actions   = ["cognito-idp:CreateUserPool"]
+    resources = ["*"]
+  }
+
   statement {
     sid     = "Monitoring"
     actions = ["cloudwatch:*", "sns:*"]

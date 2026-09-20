@@ -31,10 +31,13 @@ const MAX_BODY_BYTES = 2048;
 // A day has 1440 minutes = at most ~29 fifty-minute blocks. 30 is
 // "physically impossible to exceed honestly".
 const MAX_SESSIONS_PER_DAY = 30;
-// POSTed localDates must be near today: wide enough for every timezone
-// and a tab reopened days later, far too narrow to scatter junk across
-// decades of invisible dates.
-const POST_PAST_DAYS = 7;
+// POSTed localDates may reach as far back as GETs can see (phase 2:
+// signed-out studying queues in the browser for however long someone
+// ignores the sign-in card, and those sessions must still be deliverable
+// — the review caught a 7-day window silently deleting them). Junk-date
+// risk stays bounded: 30 sessions/day, and nothing past 400 days is
+// postable or visible.
+const POST_PAST_DAYS = 400;
 const POST_FUTURE_DAYS = 2;
 // GETs may look back far enough for any grid (26 weeks = 182 days) with
 // room to grow, but not back to year 0100.
@@ -48,11 +51,18 @@ export function makeHandler(store, now = Date.now) {
       // ?. is optional chaining: "if the left side is null/undefined,
       // give undefined instead of crashing" — a null-safe arrow operator.
 
-      // Every route requires a caller identity (phase 1: an anonymous
-      // UUID the browser invented — see CLAUDE.md on its limits).
-      const userId = event.headers?.['x-user-id'];
+      // Identity, phase 2: API Gateway's JWT authorizer has ALREADY
+      // verified the caller's Cognito token — signature, expiry, issuer,
+      // audience — before this code runs; forged or missing tokens die
+      // at the gateway with a 401. The token's `sub` claim is the
+      // account's permanent uuid, attached to the request context.
+      // (This replaced the phase-1 X-User-Id header, which anyone could
+      // invent with curl.)
+      const userId = event.requestContext?.authorizer?.jwt?.claims?.sub;
       if (!isUuid(userId)) {
-        return reply(400, { message: 'X-User-Id header must be a UUID' });
+        // Only reachable if a route were misconfigured without the
+        // authorizer — refuse loudly rather than trust anything else.
+        return reply(401, { message: 'Not authenticated' });
       }
 
       if (method === 'POST' && path === '/sessions') {
@@ -79,31 +89,40 @@ function dateStringPlusDays(nowMs, deltaDays) {
 }
 
 /*
+  Shared body plumbing for the POST routes: decode (API Gateway may hand
+  the body over base64-encoded, with a flag saying so), enforce the size
+  cap in real UTF-8 bytes (string .length counts UTF-16 units — up to 3x
+  smaller), and parse. Returns { body } on success or { error } holding a
+  ready-made 400 reply.
+*/
+function readJsonBody(event) {
+  const raw = event.body ?? '';
+  const text = event.isBase64Encoded ? Buffer.from(raw, 'base64').toString('utf8') : raw;
+
+  if (Buffer.byteLength(text, 'utf8') > MAX_BODY_BYTES) {
+    return { error: reply(400, { message: 'Body too large' }) };
+  }
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return { error: reply(400, { message: 'Body must be valid JSON' }) };
+  }
+  if (typeof body !== 'object' || body === null) {
+    return { error: reply(400, { message: 'Body must be a JSON object' }) };
+  }
+  return { body };
+}
+
+/*
   POST /sessions — body { sessionId, startedAt, minutes, localDate }.
   Returns 201 when stored, 200 when that sessionId already existed
   (a retried request must not double count — same rule the browser's
   storage module has enforced since Stage 1).
 */
 async function postSession(store, userId, event, now) {
-  // API Gateway may hand us the body base64-encoded (a flag says so).
-  const raw = event.body ?? '';
-  const text = event.isBase64Encoded ? Buffer.from(raw, 'base64').toString('utf8') : raw;
-
-  // Buffer.byteLength counts actual UTF-8 bytes; string .length counts
-  // UTF-16 code units, which can be 3x smaller for non-ASCII text.
-  if (Buffer.byteLength(text, 'utf8') > MAX_BODY_BYTES) {
-    return reply(400, { message: 'Body too large' });
-  }
-
-  let body;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return reply(400, { message: 'Body must be valid JSON' });
-  }
-  if (typeof body !== 'object' || body === null) {
-    return reply(400, { message: 'Body must be a JSON object' });
-  }
+  const { body, error } = readJsonBody(event);
+  if (error) return error;
 
   // Validate every field, with a message that names the offender —
   // "400 Bad Request: your fault, and here's why".
@@ -162,6 +181,18 @@ async function getSessions(store, userId, event, now) {
   const sessions = await store.listSessions(userId, from);
   return reply(200, { sessions });
 }
+
+/*
+  There is deliberately NO migration endpoint for phase-1 anonymous
+  history. One was designed (POST /migrate: present the old anonymous id,
+  the server copies that partition into your account) and REMOVED after
+  the security review: because Cognito account ids and the old anonymous
+  ids share one UUID keyspace, "present any UUID and receive its
+  sessions" doubled as a cross-account history reader, and the copy loop
+  was a repeatable multi-thousand-write amplifier aimed at a fixed-credit
+  account. The data it would have rescued: a single test session. When a
+  feature's blast radius outweighs its payload, delete the feature.
+*/
 
 // One place builds every response, so the shape is always the same.
 function reply(statusCode, bodyObject) {

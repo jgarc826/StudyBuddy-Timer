@@ -16,8 +16,28 @@ resource "aws_apigatewayv2_api" "api" {
       "http://localhost:8123",                                   # local development server
     ]
     allow_methods = ["GET", "POST", "OPTIONS"]
-    allow_headers = ["content-type", "x-user-id"]
+    # Phase 2: the x-user-id header is gone; identity now travels as a
+    # signed token in the standard Authorization header.
+    allow_headers = ["content-type", "authorization"]
     max_age       = 3600 # browsers may cache the preflight answer for an hour
+  }
+}
+
+# The JWT authorizer: API Gateway itself verifies each request's token —
+# signature, expiry, issuer (our user pool), audience (our app client) —
+# BEFORE the Lambda runs. Forged or missing tokens are rejected at the
+# gate with a 401 and cost us nothing. The Lambda then simply reads the
+# verified user id (the token's `sub` claim) from the request context.
+# This replaces the phase-1 X-User-Id header, which anyone could invent.
+resource "aws_apigatewayv2_authorizer" "cognito" {
+  api_id           = aws_apigatewayv2_api.api.id
+  name             = "cognito-jwt"
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.Authorization"]
+
+  jwt_configuration {
+    audience = [aws_cognito_user_pool_client.web.id]
+    issuer   = "https://cognito-idp.us-east-1.amazonaws.com/${aws_cognito_user_pool.users.id}"
   }
 }
 
@@ -30,17 +50,22 @@ resource "aws_apigatewayv2_integration" "lambda" {
   payload_format_version = "2.0"
 }
 
-# Only these two routes exist; anything else dies at the gateway.
+# Only these routes exist; anything else dies at the gateway. Every one
+# of them now requires a valid Cognito token.
 resource "aws_apigatewayv2_route" "post_sessions" {
-  api_id    = aws_apigatewayv2_api.api.id
-  route_key = "POST /sessions"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+  api_id             = aws_apigatewayv2_api.api.id
+  route_key          = "POST /sessions"
+  target             = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 resource "aws_apigatewayv2_route" "get_sessions" {
-  api_id    = aws_apigatewayv2_api.api.id
-  route_key = "GET /sessions"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+  api_id             = aws_apigatewayv2_api.api.id
+  route_key          = "GET /sessions"
+  target             = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
 # The stage: the deployed, callable instance of the API. Throttling here
