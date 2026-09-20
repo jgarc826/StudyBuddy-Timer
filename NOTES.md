@@ -949,9 +949,123 @@ by a skeptic) confirmed 17 findings — and the biggest fix was
    or 429 just waits. One end-to-end idempotency rule, unchanged since
    Stage 1, is what makes all of this composable.
 
-## Status
+## Phase 3 — friends
 
-Phase 1 (stages 1–4) and Phase 2 (accounts) are built, deployed, and
-verified. Phase 3 — friends, shared grids, "studying now" — is the only
-brief item remaining, and both the data model (`USER#` partitions) and
-the verified-identity layer it needs are already in place.
+### What changed, in one paragraph
+
+Add a friend by email; they accept or decline; you can open each other's
+contribution grids, and a green dot shows when a friend is mid-focus-
+block right now. Everything rides the same single table and the same
+verified-JWT identity — the day-one data model absorbed its third
+feature without a migration.
+
+### The design, and why
+
+- **Three new item types** under the same `USER#` partitions:
+  `REQUEST#<sender>` lives under the *recipient* (it's their inbox, and
+  one item per pair ever — request spam can't grow data),
+  `FRIEND#<other>` is stored **mirrored** under both people (so "my
+  friends" is one cheap query), and a single `NOW` item is presence.
+  All three sort *outside* the session range — and the sessions query
+  is now bounded on **both** ends (`BETWEEN`), implementing the upper
+  bound a Stage-3 reviewer proposed and a skeptic then refuted as
+  speculative. It was speculative; then it wasn't. Keeping refuted
+  findings in the log is what let us know exactly when to act on one.
+- **Accepting is a transaction**: both mirrored friendship items plus
+  request cleanup happen atomically — there is no half-friendship state,
+  ever. Unfriending likewise removes both directions *and* any pending
+  requests either way (see the review story below).
+- **Presence self-destructs**: the `NOW` item carries a DynamoDB **TTL**,
+  so the table deletes it after the block would have ended. A laptop
+  slammed shut can't look studious all night. Readers still compare the
+  timestamp — TTL deletion can lag, so it's the garbage collector, not
+  the source of truth.
+- **Privacy stances**: sending a request answers the SAME 200 whether or
+  not that email has an account (a request form must not be an account
+  oracle); a friend's grid and presence require the `FRIEND#` item under
+  the *caller's own* partition — checked on every read; presence is
+  never visible to non-friends.
+
+### The review (12 confirmed, 3 refuted), and its two best catches
+
+1. **CORS is part of an endpoint's definition.** The new `DELETE
+   /status` route existed, worked in curl, and passed every backend
+   test — and no browser could ever call it, because `allow_methods`
+   still said GET/POST. Every pause would have left you "studying" to
+   your friends for the rest of the hour, with the failure swallowed by
+   fire-and-forget error handling. A route isn't shipped until the
+   browser is allowed to speak its verb.
+2. **The stale-request resurrection.** If two people had *both* sent
+   requests before one accepted, the reverse request survived — and
+   survived *unfriending* too. A removed friend could later "accept"
+   that fossil and silently re-establish full access to your history.
+   Fixed by widening both transactions: accept and unfriend now sweep
+   requests in both directions. State machines rot at the edges nobody
+   draws.
+
+   Also fixed: backslashes in emails reaching Cognito's filter grammar
+   unescaped (validate-then-interpolate is an injection pattern even
+   when the interpreter is a *search filter*), self-unfriend
+   manufacturing DynamoDB transaction errors, `BatchGetItem`'s partial
+   answers (`UnprocessedKeys`) silently mislabeling studying friends as
+   idle, a stale-fetch race repainting a friend's grid over your own,
+   and presence dots frozen at page-load (now refreshed when the tab
+   returns to visibility, at most once a minute).
+
+### How to verify phase 3 yourself
+
+1. You need a second account — a friend's, or your own second email.
+   Add them by email; on their side the request appears with Accept /
+   Decline. Accept, then start a `?fast=1` focus block on one account
+   and watch the other's Friends card after a tab-switch: green dot,
+   "studying now". Pause — the dot dies.
+2. Click **View** on a friend: their grid, their total, and a "— studying
+   right now" title when live. The back link returns to yours.
+3. Try to cheat: `curl` `GET /friends/sessions?userId=<their sub>` with
+   your token after unfriending — **403**. The whole feature was
+   E2E-tested exactly this way: a 14-check scripted conversation
+   between two throwaway accounts (request → uniform-200 oracle check →
+   accept → presence → grid read → unfriend → both directions 403 →
+   stale-request replay refused with 404), then the browser UI pass.
+
+### Five interview questions about Phase 3
+
+1. **"How do you authorize reading someone else's data?"** By reading my
+   OWN partition: the `FRIEND#<them>` item under `USER#<me>` either
+   exists or it doesn't — one GetItem, no joins, and the check runs on
+   every request. Authorization data lives with the authorizer, written
+   only by consented transactions.
+
+2. **"Why store friendships twice?"** Read-path symmetry: both people
+   ask "who are my friends?" and each answers with one query in their
+   own partition. The cost is write-path discipline — which is why both
+   sides are written in a single DynamoDB transaction, making a
+   half-friendship unrepresentable rather than merely unlikely.
+
+3. **"How does 'studying now' avoid becoming a tracking liability?"**
+   It's bounded and consensual by construction: visible only to accepted
+   friends, set only by your own timer, capped hours ahead, and the item
+   expires by TTL. There's no location, no history of presence — one
+   bit, with a timestamp, that dies on its own.
+
+4. **"Your uniform-200 hides whether an email has an account. Where
+   else could that leak?"** Sign-up (`UsernameExistsException` — every
+   open-registration site's tension), timing differences between the
+   lookup paths, and any error message that echoes internals. We closed
+   the request-flow oracle, accept sign-up's as industry-standard, and
+   never relay raw backend errors. Enumerating your threat model's
+   *remaining* holes is the credible answer; claiming zero is not.
+
+5. **"What did this feature teach you about reviews?"** That the same
+   finding can be wrong in March and right in June: the range-query
+   upper bound was correctly refuted when sessions were the only item
+   type, and became mandatory the day a second type existed. Reviews
+   aren't verdicts about code in the abstract — they're verdicts about
+   code *under current invariants*, so record the refuted ones too;
+   they're your checklist for when invariants change.
+
+## The brief is complete
+
+Phase 1 (stages 1–4), Phase 2 (accounts), and Phase 3 (friends) are all
+built, deployed, reviewed, and verified live. Every feature in the
+original CLAUDE.md exists in production.

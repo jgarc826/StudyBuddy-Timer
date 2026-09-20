@@ -4,6 +4,8 @@ A study timer that keeps you honest. Press **Start** for a 50-minute focus
 block; a 10-minute break follows automatically. Every *completed* focus
 block is saved, and a GitHub-style contribution grid shows the last 26
 weeks of studying — one square per day, darker green for more minutes.
+Sign in from any device, add friends by email, open each other's grids,
+and see a live green dot while a friend is mid-focus-block.
 
 **Live:** https://d31po0seua3i7u.cloudfront.net *(append `?fast=1` to try
 it at 60× speed — every "minute" lasts one second)*
@@ -59,6 +61,7 @@ flowchart LR
 |---|---|
 | Cognito accounts with custom sign-in pages (plain `fetch`, no SDK) | Passwords go browser→Cognito directly and never touch our code; every API call carries a JWT that API Gateway verifies *before* Lambda runs. The phase-1 anonymous header (trust) became cryptographic verification. |
 | A designed migration endpoint was **removed** after security review | Old anonymous ids and account ids share one UUID keyspace, so "present an id, receive its history" doubled as a cross-account reader and write amplifier — for one test session of payload. Features carry a security price even when their code is correct. |
+| Friendships stored mirrored, written only by DynamoDB transactions | "My friends" is one query in my own partition, and the same item doubles as the per-request authorization check; atomicity makes half-friendships unrepresentable. Presence ("studying now") is a single TTL'd item — visible to accepted friends only, and it deletes itself when the block ends. |
 | Async storage interface from day one, while it was still localStorage | Callers awaited a value that was already there — in exchange, swapping in the network API later changed one file and zero call sites. |
 | Session IDs minted when a block *starts*, saves idempotent everywhere | A retry, refresh, or double-tab can never double-count; the same rule is enforced browser-side, and atomically in DynamoDB. |
 | Runtime-included AWS SDK, no bundling | Simplest possible deploys; accepts that AWS controls the SDK minor version. |

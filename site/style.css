@@ -166,6 +166,39 @@ h1 { font-size: 22px; margin: 0; }
 .auth-switch a { color: var(--accent); text-decoration: none; }
 .auth-switch a:hover { text-decoration: underline; }
 
+/* --- Friends ------------------------------------------------------------ */
+
+.friends-card h2 { margin: 0 0 10px; font-size: 16px; }
+
+.friend-form { display: flex; gap: 8px; margin-bottom: 6px; }
+.friend-form input {
+  flex: 1; min-width: 0;
+  font: inherit; font-size: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--card); color: var(--ink);
+}
+.friend-form input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.friend-list { list-style: none; margin: 0; padding: 0; }
+.friend-list li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 0; border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+.friend-list li:last-child { border-bottom: none; }
+.friend-list .who { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The presence dot: gray = offline/idle, green = mid-focus-block. */
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex-shrink: 0; }
+.dot.studying { background: #22c55e; }
+
+.friends-empty { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+
+.history-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+#history-back { font-size: 13px; color: var(--accent); text-decoration: none; white-space: nowrap; }
+#history-back:hover { text-decoration: underline; }
+
 .account-row {
   display: flex; align-items: center; justify-content: space-between;
   gap: 10px; margin-bottom: 10px;

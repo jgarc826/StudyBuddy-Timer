@@ -109,6 +109,7 @@ function beginFocus(now) {
     msPerMinute: MS_PER_MINUTE,
   };
   saveTimerState();
+  announceStudying(); // tell friends (best-effort, see below)
 }
 
 function pauseTimer(now) {
@@ -116,6 +117,7 @@ function pauseTimer(now) {
   timer.endsAt = null;
   timer.running = false;
   saveTimerState();
+  announceIdle();
 }
 
 function resumeTimer(now) {
@@ -123,6 +125,23 @@ function resumeTimer(now) {
   timer.remainingMs = null;
   timer.running = true;
   saveTimerState();
+  if (timer.phase === 'focus') announceStudying();
+}
+
+/*
+  Presence, fire-and-forget: the "studying now" dot friends see. Never
+  awaited and never allowed to throw — a missed update means a stale dot
+  somewhere, not lost study data. Signed out? The call fails quietly.
+  The server stores an expiry alongside, so even a laptop slammed shut
+  mid-block stops looking studious when the block would have ended.
+*/
+function announceStudying() {
+  if (timer.phase !== 'focus' || !timer.running) return;
+  StudyStorage.setStudying(new Date(timer.endsAt).toISOString()).catch(() => {});
+}
+
+function announceIdle() {
+  StudyStorage.clearStudying().catch(() => {});
 }
 
 function resetTimer() {
@@ -131,6 +150,7 @@ function resetTimer() {
   // Reset doubles as "skip the rest of the break".
   timer = idleTimer();
   saveTimerState();  // phase is idle, so this clears the stored state
+  announceIdle();
 }
 
 /*
@@ -162,6 +182,7 @@ function advance(now) {
       // minutes late and three minutes of your break are already gone.
       timer.phase = 'break';
       timer.endsAt = timer.endsAt + BREAK_MINUTES * timer.msPerMinute;
+      announceIdle(); // a break is not studying
     } else {
       // Break over -> idle. The human starts the next block.
       timer = idleTimer();
@@ -202,12 +223,42 @@ async function recordSession(session) {
   }
 }
 
-// Re-read all sessions and redraw the history panel. (For now: the total
-// line. The contribution grid joins in the next commit.)
+/*
+  Whose history the panel shows: null = mine, or {userId, email} for a
+  friend I'm peeking at (phase 3). One flag, and refreshStats() draws
+  whichever is current — the total and grid renderers don't know or care
+  whose sessions they're given.
+*/
+let viewing = null;
+
+// Guards against STALE responses: each refresh takes a ticket, and a
+// response only paints the panel if no newer refresh started meanwhile.
+// (Review-caught race: click a friend on slow WiFi, click "back", and
+// without this the late friend data would repaint over your own.)
+let refreshTicket = 0;
+
 async function refreshStats() {
+  const ticket = ++refreshTicket;
+  if (viewing) {
+    const data = await StudyStorage.friendSessions(viewing.userId);
+    if (ticket !== refreshTicket) return; // superseded while we waited
+    renderTotal(data.sessions);
+    renderGrid(data.sessions);
+    if (data.sessions.length === 0) {
+      els.totalLine.textContent = 'No sessions in the last year.';
+    }
+    els.historyTitle.textContent = data.studyingUntil
+      ? `${data.email} — studying right now`
+      : `${data.email}'s history`;
+    els.historyBack.hidden = false;
+    return;
+  }
   const sessions = await StudyStorage.loadSessions();
+  if (ticket !== refreshTicket) return; // superseded while we waited
   renderTotal(sessions);
   renderGrid(sessions);
+  els.historyTitle.textContent = 'Your history';
+  els.historyBack.hidden = true;
 }
 
 function renderTotal(sessions) {
@@ -320,6 +371,16 @@ const els = {
   accountRow: document.getElementById('account-row'),
   accountEmail: document.getElementById('account-email'),
   signoutBtn: document.getElementById('signout-btn'),
+  // Friends (phase 3)
+  friendsCard: document.getElementById('friends-card'),
+  friendForm: document.getElementById('friend-form'),
+  friendEmail: document.getElementById('friend-email'),
+  friendNote: document.getElementById('friend-note'),
+  requestList: document.getElementById('request-list'),
+  friendList: document.getElementById('friend-list'),
+  friendsEmpty: document.getElementById('friends-empty'),
+  historyTitle: document.getElementById('history-title'),
+  historyBack: document.getElementById('history-back'),
 };
 
 // 3,000,000 ms at 60,000 ms/minute -> "50:00". In fast mode one nominal
@@ -402,6 +463,7 @@ function authUi() {
   const email = StudyAuth.currentEmail();
   els.authCard.hidden = email !== null;
   els.accountRow.hidden = email === null;
+  els.friendsCard.hidden = email === null;
   if (email) els.accountEmail.textContent = email;
 
   els.authTitle.textContent =
@@ -424,6 +486,7 @@ function authNote(text, isError) {
 async function afterSignIn() {
   authNote('');
   await refreshStats(); // also delivers any sessions queued while signed out
+  loadFriends().catch(err => console.error('Could not load friends:', err));
   authUi();
 }
 
@@ -478,7 +541,105 @@ async function onAuthSubmit(submitEvent) {
   authUi();
 }
 
-/* ===== 8. Wiring & startup ============================================= */
+/* ===== 8. Friends (phase 3) ============================================ */
+
+function friendNote(text, isError) {
+  els.friendNote.textContent = text;
+  els.friendNote.hidden = !text;
+  els.friendNote.classList.toggle('error', Boolean(isError));
+}
+
+// One list row. document.createElement instead of innerHTML on purpose:
+// emails are user-controlled text, and textContent can't be tricked into
+// becoming markup the way string-built HTML can.
+function friendRow({ dotClass, label, buttons }) {
+  const li = document.createElement('li');
+  if (dotClass !== null) {
+    const dot = document.createElement('span');
+    dot.className = dotClass;
+    li.appendChild(dot);
+  }
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = label;
+  li.appendChild(who);
+  for (const { text, primary, onClick } of buttons) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = primary ? 'btn btn-small btn-primary' : 'btn btn-small';
+    btn.textContent = text;
+    btn.addEventListener('click', onClick);
+    li.appendChild(btn);
+  }
+  return li;
+}
+
+let friendsLoadedAt = 0; // for the freshness reload below
+
+async function loadFriends() {
+  friendsLoadedAt = Date.now();
+  const { friends, requests } = await StudyStorage.friends();
+
+  els.requestList.replaceChildren(...requests.map(r => friendRow({
+    dotClass: null,
+    label: `${r.fromEmail} wants to be friends`,
+    buttons: [
+      { text: 'Accept', primary: true, onClick: () => answerRequest(StudyStorage.acceptFriend, r.fromUserId) },
+      { text: 'Decline', primary: false, onClick: () => answerRequest(StudyStorage.declineFriend, r.fromUserId) },
+    ],
+  })));
+
+  els.friendList.replaceChildren(...friends.map(f => friendRow({
+    dotClass: f.studying ? 'dot studying' : 'dot',
+    label: f.studying ? `${f.email} — studying now` : f.email,
+    buttons: [
+      { text: 'View', primary: false, onClick: () => viewFriend(f) },
+      { text: 'Remove', primary: false, onClick: () => unfriend(f) },
+    ],
+  })));
+
+  els.friendsEmpty.hidden = friends.length > 0 || requests.length > 0;
+}
+
+async function answerRequest(action, fromUserId) {
+  try {
+    await action(fromUserId);
+    await loadFriends();
+  } catch (err) {
+    friendNote(err.message, true);
+  }
+}
+
+function viewFriend(friend) {
+  viewing = { userId: friend.userId, email: friend.email };
+  refreshStats().catch(err => {
+    viewing = null;
+    friendNote(err.message, true);
+  });
+}
+
+async function unfriend(friend) {
+  // confirm() is the browser's built-in blocking OK/Cancel dialog —
+  // crude, but honest, and plenty for a rare destructive action.
+  if (!confirm(`Remove ${friend.email} from your friends?`)) return;
+  try {
+    await StudyStorage.removeFriend(friend.userId);
+    if (viewing?.userId === friend.userId) viewing = null;
+    await loadFriends();
+    await refreshStats();
+  } catch (err) {
+    friendNote(err.message, true);
+  }
+}
+
+function clearFriendsUi() {
+  els.requestList.replaceChildren();
+  els.friendList.replaceChildren();
+  els.friendsEmpty.hidden = false;
+  friendNote('');
+}
+
+/* ===== 9. Wiring & startup ============================================= */
 
 // The heartbeat, ~4x per second. Advancing BEFORE rendering means the tick
 // that crosses the finish line already draws the next phase.
@@ -515,6 +676,16 @@ els.resetBtn.addEventListener('click', () => {
 // waiting for the next (possibly throttled) tick.
 document.addEventListener('visibilitychange', tick);
 
+// ...and refresh the friends panel too (at most once a minute), so the
+// "studying now" dots reflect the present, not whenever the tab was
+// last opened. No polling while the tab sits hidden — free-tier manners.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && StudyAuth.currentEmail()
+      && Date.now() - friendsLoadedAt > 60 * 1000) {
+    loadFriends().catch(() => {});
+  }
+});
+
 // Account events.
 els.authForm.addEventListener('submit', onAuthSubmit);
 
@@ -530,8 +701,29 @@ els.signoutBtn.addEventListener('click', () => {
   // not wait on the network — local sign-out already happened.
   StudyAuth.signOut().catch(() => {});
   authMode = 'signin';
+  viewing = null;
+  clearFriendsUi();
   refreshStats().catch(err => console.error('Could not refresh history:', err));
   authUi();
+});
+
+els.friendForm.addEventListener('submit', async submitEvent => {
+  submitEvent.preventDefault();
+  const email = els.friendEmail.value.trim();
+  if (!email) return;
+  try {
+    const out = await StudyStorage.sendFriendRequest(email);
+    els.friendEmail.value = '';
+    friendNote(out.message); // "If that account exists, they have your request."
+  } catch (err) {
+    friendNote(err.message, true);
+  }
+});
+
+els.historyBack.addEventListener('click', clickEvent => {
+  clickEvent.preventDefault();
+  viewing = null;
+  refreshStats().catch(err => console.error('Could not refresh history:', err));
 });
 
 // ---- Startup. Runs once: the <script> tag sits at the END of <body>, so
@@ -550,4 +742,7 @@ authUi(); // show the sign-in card or the account row, depending
 // Draw the history panel from whatever is already stored. The .catch is the
 // safety net for a rejected Promise (an exception in async clothing).
 refreshStats().catch(err => console.error('Could not load history:', err));
+if (StudyAuth.currentEmail()) {
+  loadFriends().catch(err => console.error('Could not load friends:', err));
+}
 setInterval(tick, 250);  // "call tick() every 250 ms", forever

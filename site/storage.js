@@ -139,6 +139,12 @@ const StudyStorage = (function () {
     }
   }
 
+  // The oldest date history queries ask for (same window the server allows).
+  function historyFrom() {
+    return new Date(Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 10);
+  }
+
   async function loadSessions() {
     // Signed out: the grid still shows whatever is waiting in the queue —
     // those minutes were studied, delivered or not.
@@ -148,9 +154,7 @@ const StudyStorage = (function () {
 
     await flushPending(); // deliver stragglers before asking for history
 
-    const from = new Date(Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000)
-      .toISOString().slice(0, 10);
-    const res = await fetch(`${API_BASE}/sessions?from=${from}`, {
+    const res = await fetch(`${API_BASE}/sessions?from=${historyFrom()}`, {
       headers: await authHeader(),
     });
     if (!res.ok) {
@@ -168,5 +172,45 @@ const StudyStorage = (function () {
     return sessions;
   }
 
-  return { saveSession, loadSessions };
+  /* ---- Phase 3: the friends & presence API ---- */
+
+  // One little helper for every authenticated JSON call.
+  async function api(path, { method = 'GET', body } = {}) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: {
+        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+        ...(await authHeader()),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      throw new Error(`API error ${res.status}: ${await res.text()}`);
+    }
+    return res.json();
+  }
+
+  const friends = () => api('/friends');
+  const sendFriendRequest = email =>
+    api('/friends/requests', { method: 'POST', body: { email } });
+  const acceptFriend = fromUserId =>
+    api('/friends/accept', { method: 'POST', body: { fromUserId } });
+  const declineFriend = fromUserId =>
+    api('/friends/decline', { method: 'POST', body: { fromUserId } });
+  const removeFriend = userId =>
+    api('/friends/remove', { method: 'POST', body: { userId } });
+  const friendSessions = userId =>
+    api(`/friends/sessions?userId=${encodeURIComponent(userId)}&from=${historyFrom()}`);
+
+  // Presence is best-effort by design: fire it and forget it. A missed
+  // update means a stale dot for a friend, never lost study data.
+  const setStudying = untilIso =>
+    api('/status', { method: 'POST', body: { until: untilIso } });
+  const clearStudying = () => api('/status', { method: 'DELETE' });
+
+  return {
+    saveSession, loadSessions,
+    friends, sendFriendRequest, acceptFriend, declineFriend, removeFriend,
+    friendSessions, setStudying, clearStudying,
+  };
 })();

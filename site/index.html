@@ -51,13 +51,31 @@
       <p class="auth-switch"><a href="#" id="auth-toggle">Need an account? Sign up</a></p>
     </section>
 
-    <!-- Study history: total hours and the contribution grid. -->
+    <!-- Friends (phase 3): add by email, answer requests, see who's
+         studying right now. Hidden while signed out. -->
+    <section class="card friends-card" id="friends-card" hidden aria-label="Friends">
+      <h2>Friends</h2>
+      <form id="friend-form" class="friend-form">
+        <input id="friend-email" type="email" placeholder="friend's email">
+        <button type="submit" class="btn btn-small btn-primary">Add</button>
+      </form>
+      <p id="friend-note" class="auth-message" hidden></p>
+      <ul id="request-list" class="friend-list"></ul>
+      <ul id="friend-list" class="friend-list"></ul>
+      <p id="friends-empty" class="friends-empty">No friends yet — add one by email.</p>
+    </section>
+
+    <!-- Study history: total hours and the contribution grid. Doubles as
+         the viewer for a FRIEND's history (the back link returns home). -->
     <section class="card history-card" aria-label="Study history">
       <div class="account-row" id="account-row" hidden>
         <span class="account-email" id="account-email"></span>
         <button id="signout-btn" type="button" class="btn btn-small">Sign out</button>
       </div>
-      <h2>Your history</h2>
+      <div class="history-head">
+        <h2 id="history-title">Your history</h2>
+        <a href="#" id="history-back" hidden>← back to yours</a>
+      </div>
       <p id="total-line" class="total-line">No sessions yet.</p>
 
       <!-- GitHub-style contribution grid: one square per day, filled in by
