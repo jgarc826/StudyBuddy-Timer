@@ -24,7 +24,11 @@ DIST_ID="$(terraform -chdir=infra output -raw cloudfront_distribution_id)"
 echo "==> Syncing site/ to s3://${BUCKET}"
 # sync uploads new/changed files only; --delete also removes bucket files
 # that no longer exist locally, so the bucket mirrors site/ exactly.
-aws s3 sync site/ "s3://${BUCKET}" --delete
+# no-cache makes BROWSERS revalidate every file on each visit (cheap 304s)
+# instead of reusing hoarded copies — without it, a returning visitor can
+# run last week's JavaScript against this week's HTML, which is exactly
+# the "clicking sign-up does nothing" bug this line exists to prevent.
+aws s3 sync site/ "s3://${BUCKET}" --delete --cache-control "no-cache"
 
 echo "==> Invalidating CloudFront cache (${DIST_ID})"
 # CloudFront edges may hold copies for up to a day; an invalidation tells
