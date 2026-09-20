@@ -7,4 +7,8 @@
 */
 const STUDYBUDDY_CONFIG = {
   apiBaseUrl: 'https://mm725try13.execute-api.us-east-1.amazonaws.com',
+  // The Cognito app-client id (from `terraform output cognito_client_id`).
+  // Public by design: it identifies OUR app to Cognito but grants nothing
+  // without a real password.
+  cognitoClientId: '52l7u50frun5vejrq17r62btb4',
 };

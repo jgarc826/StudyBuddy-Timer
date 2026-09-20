@@ -21,7 +21,8 @@ flowchart LR
     B[Browser<br/>plain HTML/CSS/JS]
     B -->|HTTPS| CF[CloudFront CDN]
     CF -->|Origin Access Control| S3[(Private S3 bucket<br/>static site)]
-    B -->|fetch + X-User-Id| GW[API Gateway<br/>HTTP API]
+    B <-->|sign in / tokens| COG[Cognito<br/>user pool]
+    B -->|fetch + Bearer JWT| GW[API Gateway<br/>HTTP API<br/>JWT authorizer]
     GW --> L[Lambda<br/>Node.js 24, arm64]
     L --> DB[(DynamoDB<br/>single table)]
     L -.logs.-> CW[CloudWatch<br/>14-day retention]
@@ -29,8 +30,9 @@ flowchart LR
     GH[GitHub Actions<br/>OIDC, no stored keys] -.terraform apply<br/>+ site deploy.-> CF
 ```
 
-- **Frontend** ([site/](site/)): no framework, no build step, no npm. Four
-  script files served as-is. The timer computes remaining time from an
+- **Frontend** ([site/](site/)): no framework, no build step, no npm. Five
+  script files served as-is — including sign-up/sign-in against Cognito
+  in plain `fetch`. The timer computes remaining time from an
   end-timestamp, so throttled background tabs and page refreshes can't
   make it drift.
 - **API** ([backend/](backend/)): one Lambda behind an HTTP API.
@@ -55,7 +57,8 @@ flowchart LR
 
 | Decision | Trade-off accepted |
 |---|---|
-| Anonymous identity: a UUID in localStorage, sent as `X-User-Id` | Phase-1 simplicity. History is tied to one browser, and anyone holding the ID can read/write that history. Phase 2 (Cognito accounts) replaces it. |
+| Cognito accounts with custom sign-in pages (plain `fetch`, no SDK) | Passwords go browser→Cognito directly and never touch our code; every API call carries a JWT that API Gateway verifies *before* Lambda runs. The phase-1 anonymous header (trust) became cryptographic verification. |
+| A designed migration endpoint was **removed** after security review | Old anonymous ids and account ids share one UUID keyspace, so "present an id, receive its history" doubled as a cross-account reader and write amplifier — for one test session of payload. Features carry a security price even when their code is correct. |
 | Async storage interface from day one, while it was still localStorage | Callers awaited a value that was already there — in exchange, swapping in the network API later changed one file and zero call sites. |
 | Session IDs minted when a block *starts*, saves idempotent everywhere | A retry, refresh, or double-tab can never double-count; the same rule is enforced browser-side, and atomically in DynamoDB. |
 | Runtime-included AWS SDK, no bundling | Simplest possible deploys; accepts that AWS controls the SDK minor version. |
@@ -102,14 +105,18 @@ and nothing that bills by the hour.
 
 ## Known limits
 
-- One browser = one identity; clearing site data orphans your history
-  (the ID is gone, the sessions remain unreachable). Real accounts are
-  phase 2.
-- The anonymous API cannot stop someone inventing user IDs; abuse is
-  rate-limited and per-request-bounded rather than impossible.
+- Auth tokens live in localStorage — acceptable because the page runs
+  zero third-party scripts; a signed-out ID token stays technically
+  valid for its final hour (the gateway checks signatures, not
+  revocation lists), though sign-out does revoke the refresh token.
+- Sign-up necessarily reveals whether an email already has an account
+  (as on every open-registration site); sign-in does not.
+- On a shared browser, sessions studied while signed out are delivered
+  to whichever account signs in next.
 - Totals cover the last ~400 days (the API's query window), not all time.
 - A focus block completed while the tab is closed on a dead battery is
-  lost; one queued on a flaky network is retried and kept.
+  lost; one queued on a flaky network — or while signed out — is kept
+  and delivered later.
 
 ## How AI was used
 

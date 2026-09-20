@@ -822,8 +822,136 @@ is what a real bring-up looks like.
    the Lambda role, which needs — and has — exactly two actions on one
    table.
 
-## The project is complete
+## Phase 2 — real accounts (Amazon Cognito)
 
-All four stages are built, deployed, documented, and verified. Later
-phases (Cognito accounts, then friends) start from a data model and an
-identity header that were designed for them on day one.
+### What changed, in one paragraph
+
+Sign up with email + password (verified by a 6-digit emailed code), sign
+in from any browser, and your history follows the *account*. Under the
+hood the fakeable `X-User-Id` header is gone: the browser now attaches a
+**signed token** to every API call, **API Gateway verifies the signature
+before Lambda runs**, and the Lambda reads the verified account id from
+the request context. Passwords never touch our code or servers — the
+browser talks to Cognito directly, and Cognito stores only a hash.
+
+### The moving parts
+
+- `infra/cognito.tf` — the **user pool** (Cognito's managed user
+  database; LITE tier for the most generous free allowance) and the
+  **app client**: our page's public identifier. Public on purpose — a
+  browser can't keep secrets, so the client id grants nothing without a
+  real password. `prevent_user_existence_errors` makes wrong-email and
+  wrong-password failures indistinguishable at sign-in.
+- `infra/api.tf` — the **JWT authorizer**. A JWT is a signed statement
+  ("this is account X until time T"); the gateway checks signature,
+  expiry, issuer (our pool), and audience (our client) on every request
+  and rejects failures with a 401 *before* any code of ours runs, at
+  zero Lambda cost.
+- `site/auth.js` — sign-up/confirm/sign-in/refresh against Cognito's
+  public API with plain `fetch` (the operation name travels in an
+  `X-Amz-Target` header). Tokens live in localStorage (documented
+  trade-off: this page runs zero third-party scripts); the ID token
+  expires hourly and a 30-day refresh token renews it silently.
+  Sign-out clears locally AND revokes the refresh token at Cognito.
+- `site/app.js` — a three-state auth card (sign in / create account /
+  confirm code), the same state-machine pattern as the timer.
+- `site/storage.js` — every call now carries `Authorization: Bearer
+  <token>`. **Signed-out studying is never lost**: completed blocks go
+  to the same offline queue built for network failures, appear on the
+  grid, and are delivered on the next sign-in.
+
+### The review that reshaped it (17 confirmed findings)
+
+The adversarial review (three reviewers, every finding cross-examined
+by a skeptic) confirmed 17 findings — and the biggest fix was
+**deleting a feature**:
+
+- **The /migrate endpoint died.** Designed to import phase-1 anonymous
+  history ("present the old id, receive its sessions"), it turned out to
+  be three things at once: a repeatable ~6,000-write amplifier aimed at
+  a fixed-credit account, a **cross-account history reader** (Cognito
+  account ids are UUIDs in the *same keyspace* as the old anonymous ids,
+  so "any UUID" included other people's accounts), and a Lambda-timeout
+  risk. The data it would have rescued: one test session. When a
+  feature's blast radius outweighs its payload, delete the feature —
+  and say so in the log.
+- **The queue no longer discards studying.** Any 4xx used to mean
+  "never retry"; but a 401 is just a stale token and a 429 is just
+  throttling. Only a 400 (validation) is final now. Relatedly, the
+  7-day POST window would have silently deleted sessions queued while
+  signed out for longer; it now matches the 400-day read window.
+- **CI lost its account-takeover powers.** `cognito-idp:*` would have
+  let a compromised pipeline call `AdminSetUserPassword` on any user.
+  CI now manages pool *configuration* only — no `Admin*` actions —
+  with `CreateUserPool` alone on `*` (AWS supports no ARN for a pool
+  that doesn't exist yet; documented wildcard #3).
+- Assorted real bugs: author CSS `display:flex` silently defeating the
+  HTML `hidden` attribute (any author `display` wins the cascade over
+  the browser's built-in `[hidden]` rule); the confirm→sign-in pair not
+  surviving a network blip between them; size-limit tests that passed
+  via JSON-parse errors and so tested nothing.
+- Accepted with eyes open: sign-up email enumeration (inherent to every
+  open-registration site), a shared browser attributing signed-out
+  studying to whoever signs in next, and a signed-out ID token staying
+  technically valid for its final hour (gateways check signatures, not
+  revocation lists).
+
+### How to verify phase 2 yourself
+
+1. On the live site, create your real account: sign up, enter the code
+   from your email, and you land signed in. Finish a `?fast=1` session —
+   it saves; open the same account on your phone — same history.
+2. `curl` the API with the old header (`-H "x-user-id: <any uuid>"`) —
+   **401**, before Lambda ever runs. The anonymous era is over.
+3. DevTools → Application → Local Storage: `studybuddy.auth.v1` holds
+   your tokens; paste the ID token into jwt.io to see exactly what the
+   gateway verifies. Sign out and watch it vanish.
+4. Study while signed out: the block lands on the grid immediately
+   (queued locally), and delivers the moment you sign in.
+
+### Five interview questions about Phase 2
+
+1. **"Walk me through what happens when the API receives a request."**
+   The gateway verifies the JWT — signature against Cognito's published
+   public keys, expiry, issuer, audience — and rejects failures with a
+   401 before any application code runs. The Lambda receives the
+   already-verified claims and uses `sub` as the user id. Compare phase
+   1: the server simply believed a header. The difference is
+   *cryptographic verification versus trust*.
+
+2. **"Why do the sign-in pages talk to Cognito directly instead of
+   through your backend?"** The password should touch as few systems as
+   possible. Browser→Cognito over TLS means our Lambda, logs, and code
+   never see it — there's nothing for us to leak. Our backend's only
+   auth job is *verifying* the resulting tokens, which the gateway does.
+
+3. **"You built a migration endpoint and then deleted it. Why?"**
+   Review showed its trust model didn't survive phase 2: old anonymous
+   ids and new account ids share one UUID keyspace, so "show me a UUID,
+   receive its history" doubled as a cross-account reader — plus an
+   uncapped write amplifier on a fixed-credit account. It protected one
+   test session. Deleting it removed two attack classes for zero user
+   cost; the lesson is that features carry a security price even when
+   their code is correct.
+
+4. **"Where are tokens stored, and what's the trade-off?"** localStorage:
+   simple, survives restarts, readable by any script on the page — which
+   is acceptable *here* because the page runs no third-party code.
+   Sites with ads or analytics keep tokens in memory to shrink the XSS
+   blast radius and pay with more complex refresh handling. Naming the
+   condition that makes your choice valid is the actual answer.
+
+5. **"What happens to a session finished on the subway, signed out?"**
+   It queues in localStorage with its id minted at block start, shows on
+   the grid immediately, and is delivered after the next sign-in.
+   Delivery is safe to retry because the server's conditional write is
+   idempotent; only a validation 400 abandons a queued session — a 401
+   or 429 just waits. One end-to-end idempotency rule, unchanged since
+   Stage 1, is what makes all of this composable.
+
+## Status
+
+Phase 1 (stages 1–4) and Phase 2 (accounts) are built, deployed, and
+verified. Phase 3 — friends, shared grids, "studying now" — is the only
+brief item remaining, and both the data model (`USER#` partitions) and
+the verified-identity layer it needs are already in place.

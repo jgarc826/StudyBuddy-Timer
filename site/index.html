@@ -36,9 +36,27 @@
       </div>
     </section>
 
-    <!-- Study history. Later commits fill this in: total hours, then the
-         contribution grid. -->
+    <!-- Account: sign in / sign up. JavaScript hides this card once
+         signed in, and shows the account row in the history card instead. -->
+    <section class="card auth-card" id="auth-card" aria-label="Account">
+      <h2 id="auth-title">Sign in</h2>
+      <p class="auth-hint">Your study history follows your account — any browser, any device.</p>
+      <form id="auth-form">
+        <input id="auth-email" type="email" placeholder="email" autocomplete="email">
+        <input id="auth-password" type="password" placeholder="password (8+ characters)" autocomplete="current-password">
+        <input id="auth-code" type="text" placeholder="6-digit code from your email" inputmode="numeric" hidden>
+        <button id="auth-submit" type="submit" class="btn btn-primary">Sign in</button>
+      </form>
+      <p class="auth-message" id="auth-message" hidden></p>
+      <p class="auth-switch"><a href="#" id="auth-toggle">Need an account? Sign up</a></p>
+    </section>
+
+    <!-- Study history: total hours and the contribution grid. -->
     <section class="card history-card" aria-label="Study history">
+      <div class="account-row" id="account-row" hidden>
+        <span class="account-email" id="account-email"></span>
+        <button id="signout-btn" type="button" class="btn btn-small">Sign out</button>
+      </div>
       <h2>Your history</h2>
       <p id="total-line" class="total-line">No sessions yet.</p>
 
@@ -62,9 +80,10 @@
 
   <!-- Behavior lives in separate files, loaded at the END of <body> so that
        every element above already exists when the scripts run. Order
-       matters, like link order: config.js defines the API URL, storage.js
-       uses it to define StudyStorage, and app.js uses that. -->
+       matters, like link order: config.js holds addresses, auth.js owns
+       tokens, storage.js uses both, app.js uses everything. -->
   <script src="config.js"></script>
+  <script src="auth.js"></script>
   <script src="storage.js"></script>
   <script src="app.js"></script>
 </body>

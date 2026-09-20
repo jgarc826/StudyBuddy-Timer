@@ -1,26 +1,23 @@
 'use strict';
 /*
-  StudyBuddy storage module — Stage 3 edition: the SAME two-function
-  interface as Stage 1, with completely different insides. app.js has not
-  changed by a single character, which was the whole point of freezing an
-  async contract on day one.
-
-  Interface (unchanged since Stage 1):
+  StudyBuddy storage module — phase 2 edition. The core interface is
+  unchanged since Stage 1:
 
     StudyStorage.saveSession(session) -> Promise of 'created' | 'duplicate' | 'queued'
     StudyStorage.loadSessions()       -> Promise of an array of sessions
 
-  New internals:
+  Internals:
 
   - Data lives in DynamoDB behind our API; this file talks to it with
     fetch(), the browser's built-in HTTP client.
-  - Identity: on first visit we invent a UUID, keep it in localStorage,
-    and send it on every call in an X-User-Id header. (Phase-1 identity —
-    anyone holding this ID can read/write that history; real accounts
-    come in phase 2. See the README notes.)
-  - Resilience: if the network is down when a session finishes, the
-    session is queued in localStorage and re-sent later. The server
-    treats a repeated sessionId as a no-op, so retrying is always safe.
+  - Identity (phase 2): every call carries the signed-in account's ID
+    token in the standard Authorization header; auth.js owns the tokens.
+    The phase-1 anonymous X-User-Id header is gone — migrateLegacy()
+    imports that old history into the account, once.
+  - Resilience: if a session can't be delivered when it finishes —
+    network down OR simply signed out — it is queued in localStorage,
+    shown on the grid, and re-sent later. The server treats a repeated
+    sessionId as a no-op, so retrying is always safe.
 
   One consequence of the API swap: opening index.html straight from disk
   (file://) can no longer load history — browsers send "Origin: null"
@@ -30,22 +27,21 @@
 const StudyStorage = (function () {
 
   const API_BASE = STUDYBUDDY_CONFIG.apiBaseUrl; // from config.js
-  const USER_ID_KEY = 'studybuddy.userId.v1';
   const PENDING_KEY = 'studybuddy.pendingSessions.v1';
 
   // How far back to ask for history. The server refuses 'from' older
   // than 400 days; 399 keeps us safely inside even across midnight.
   const HISTORY_DAYS = 399;
 
-  /* ---- identity ---- */
-
-  function getUserId() {
-    let id = localStorage.getItem(USER_ID_KEY);
-    if (!id) {
-      id = crypto.randomUUID();
-      localStorage.setItem(USER_ID_KEY, id);
+  // A valid ID token, or a thrown error shaped like a network failure —
+  // which makes the save path below queue the session instead of losing
+  // it (signed-out is just another kind of "can't deliver right now").
+  async function authHeader() {
+    const token = await StudyAuth.idToken();
+    if (!token) {
+      throw new Error('Signed out — session queued until sign-in');
     }
-    return id;
+    return { authorization: `Bearer ${token}` };
   }
 
   /* ---- talking to the API ---- */
@@ -62,19 +58,21 @@ const StudyStorage = (function () {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-user-id': getUserId(),
+        ...(await authHeader()),
       },
       body: JSON.stringify(session),
     });
     if (res.status === 201) return 'created';
     if (res.status === 200) return 'duplicate';
 
-    // The server answered but said no. Mark 4xx errors as `rejected`:
-    // re-sending an invalid session will never succeed, so the retry
-    // queue must not keep it. (5xx = server hiccup -> retrying is fine.)
+    // The server answered but said no. ONLY a 400 (validation) means
+    // "re-sending will never succeed" — the review caught the original
+    // any-4xx rule here discarding real studying: a 401 is a stale token
+    // (retry after refresh/sign-in) and a 429 is throttling (retry
+    // later). 5xx = server hiccup; also retry.
     const detail = await res.text();
     const err = new Error(`API refused the session (${res.status}): ${detail}`);
-    err.rejected = res.status >= 400 && res.status < 500;
+    err.rejected = res.status === 400;
     throw err;
     // A network failure (offline, DNS, ...) never reaches this line —
     // fetch itself throws, and that error has no `rejected` flag.
@@ -142,12 +140,18 @@ const StudyStorage = (function () {
   }
 
   async function loadSessions() {
+    // Signed out: the grid still shows whatever is waiting in the queue —
+    // those minutes were studied, delivered or not.
+    if (!(await StudyAuth.idToken())) {
+      return pendingQueue.read();
+    }
+
     await flushPending(); // deliver stragglers before asking for history
 
     const from = new Date(Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000)
       .toISOString().slice(0, 10);
     const res = await fetch(`${API_BASE}/sessions?from=${from}`, {
-      headers: { 'x-user-id': getUserId() },
+      headers: await authHeader(),
     });
     if (!res.ok) {
       throw new Error(`Could not load history (${res.status})`);

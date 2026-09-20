@@ -307,6 +307,19 @@ const els = {
   totalLine: document.getElementById('total-line'),
   grid: document.getElementById('grid'),
   gridMonths: document.getElementById('grid-months'),
+  // Account UI (phase 2)
+  authCard: document.getElementById('auth-card'),
+  authTitle: document.getElementById('auth-title'),
+  authForm: document.getElementById('auth-form'),
+  authEmail: document.getElementById('auth-email'),
+  authPassword: document.getElementById('auth-password'),
+  authCode: document.getElementById('auth-code'),
+  authSubmit: document.getElementById('auth-submit'),
+  authMessage: document.getElementById('auth-message'),
+  authToggle: document.getElementById('auth-toggle'),
+  accountRow: document.getElementById('account-row'),
+  accountEmail: document.getElementById('account-email'),
+  signoutBtn: document.getElementById('signout-btn'),
 };
 
 // 3,000,000 ms at 60,000 ms/minute -> "50:00". In fast mode one nominal
@@ -368,7 +381,104 @@ function render() {
     : `${clockText} · ${timer.phase === 'focus' ? 'Focus' : 'Break'} — StudyBuddy Timer`;
 }
 
-/* ===== 7. Wiring & startup ============================================= */
+/* ===== 7. Account UI (phase 2) ========================================= */
+/*
+  A tiny state machine, same pattern as the timer: `authMode` is the
+  state, authUi() redraws everything from it. Three modes:
+
+    signin  -> email + password, submit calls StudyAuth.signIn
+    signup  -> same fields, submit calls StudyAuth.signUp
+    confirm -> the 6-digit emailed code, submit confirms then signs in
+
+  The password is held in a variable only between sign-up and the
+  confirm step (so the user needn't retype it), never stored anywhere.
+*/
+
+let authMode = 'signin';
+let pendingEmail = null;
+let pendingPassword = null;
+
+function authUi() {
+  const email = StudyAuth.currentEmail();
+  els.authCard.hidden = email !== null;
+  els.accountRow.hidden = email === null;
+  if (email) els.accountEmail.textContent = email;
+
+  els.authTitle.textContent =
+    { signin: 'Sign in', signup: 'Create account', confirm: 'Check your email' }[authMode];
+  els.authSubmit.textContent =
+    { signin: 'Sign in', signup: 'Sign up', confirm: 'Confirm' }[authMode];
+  els.authToggle.textContent = authMode === 'signin'
+    ? 'Need an account? Sign up' : 'Have an account? Sign in';
+  els.authCode.hidden = authMode !== 'confirm';
+  els.authEmail.hidden = authMode === 'confirm';
+  els.authPassword.hidden = authMode === 'confirm';
+}
+
+function authNote(text, isError) {
+  els.authMessage.textContent = text;
+  els.authMessage.hidden = !text;
+  els.authMessage.classList.toggle('error', Boolean(isError));
+}
+
+async function afterSignIn() {
+  authNote('');
+  await refreshStats(); // also delivers any sessions queued while signed out
+  authUi();
+}
+
+async function onAuthSubmit(submitEvent) {
+  // Forms normally RELOAD the page on submit (their 1990s default);
+  // preventDefault() says "we handle this in JavaScript instead".
+  submitEvent.preventDefault();
+  const email = els.authEmail.value.trim();
+  const password = els.authPassword.value;
+
+  els.authSubmit.disabled = true; // no double-submits while we wait
+  try {
+    if (authMode === 'signup') {
+      await StudyAuth.signUp(email, password);
+      pendingEmail = email;
+      pendingPassword = password;
+      authMode = 'confirm';
+      authNote(`We emailed a 6-digit code to ${email}.`);
+    } else if (authMode === 'confirm') {
+      try {
+        await StudyAuth.confirm(pendingEmail, els.authCode.value.trim());
+      } catch (err) {
+        // If a previous submit confirmed the account but the follow-up
+        // sign-in failed (flaky network), a re-submit re-confirms an
+        // already-confirmed user and Cognito objects — treat that
+        // specific objection as "fine, carry on to sign-in".
+        const alreadyConfirmed = err.code === 'NotAuthorizedException'
+          && /confirmed/i.test(err.message);
+        if (!alreadyConfirmed) throw err;
+      }
+      await StudyAuth.signIn(pendingEmail, pendingPassword);
+      pendingPassword = null;
+      await afterSignIn();
+    } else {
+      await StudyAuth.signIn(email, password);
+      await afterSignIn();
+    }
+  } catch (err) {
+    if (err.code === 'UserNotConfirmedException') {
+      // They signed up earlier but never entered the code.
+      pendingEmail = email;
+      pendingPassword = password;
+      authMode = 'confirm';
+      StudyAuth.resendCode(email).catch(() => {});
+      authNote('Your email was never confirmed — we sent a fresh code.');
+    } else {
+      authNote(err.message, true);
+    }
+  } finally {
+    els.authSubmit.disabled = false;
+  }
+  authUi();
+}
+
+/* ===== 8. Wiring & startup ============================================= */
 
 // The heartbeat, ~4x per second. Advancing BEFORE rendering means the tick
 // that crosses the finish line already draws the next phase.
@@ -405,6 +515,25 @@ els.resetBtn.addEventListener('click', () => {
 // waiting for the next (possibly throttled) tick.
 document.addEventListener('visibilitychange', tick);
 
+// Account events.
+els.authForm.addEventListener('submit', onAuthSubmit);
+
+els.authToggle.addEventListener('click', clickEvent => {
+  clickEvent.preventDefault(); // it's an <a>, but it navigates nowhere
+  authMode = authMode === 'signin' ? 'signup' : 'signin';
+  authNote('');
+  authUi();
+});
+
+els.signoutBtn.addEventListener('click', () => {
+  // signOut is async (it revokes the token at Cognito) but the UI must
+  // not wait on the network — local sign-out already happened.
+  StudyAuth.signOut().catch(() => {});
+  authMode = 'signin';
+  refreshStats().catch(err => console.error('Could not refresh history:', err));
+  authUi();
+});
+
 // ---- Startup. Runs once: the <script> tag sits at the END of <body>, so
 // every element referenced above already exists. ----
 
@@ -417,6 +546,7 @@ if (restored) {
 }
 
 render();
+authUi(); // show the sign-in card or the account row, depending
 // Draw the history panel from whatever is already stored. The .catch is the
 // safety net for a rejected Promise (an exception in async clothing).
 refreshStats().catch(err => console.error('Could not load history:', err));
